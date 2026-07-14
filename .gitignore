@@ -1,0 +1,17 @@
+# qmake / C++ build output
+Makefile
+*.o
+libtorrent_peer_collector_qt
+*.exe
+.qmake.stash
+
+*_Debug*
+*_Release*
+
+.*
+
+*.moc
+moc_predefs.h
+
+!.qtcreator
+!.gitignore
