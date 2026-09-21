@@ -6,9 +6,13 @@ Guidance for AI agents and new contributors working in this repository.
 
 A single-executable Qt 6 Widgets desktop tool that opens a `.torrent` file in a
 real libtorrent-rasterbar session for a fixed run time, collects every IPv4
-peer endpoint it sees, and shows them in a text tab. Nothing is written to
-disk on its own: Copy Peers puts the tab on the clipboard, Save Peers writes
-it to a file chosen in a dialog (last folder remembered in `paths/peers_dir`). It is a C++ port
+peer endpoint it sees, and shows them in a sortable table (IP, port, sources,
+IPinfo country/city/provider/host). Nothing is written to disk on its own:
+Copy Peers puts the table on the clipboard as text in its current sort order,
+Save Peers writes the same text to a file chosen in a dialog (last folder
+remembered in `paths/peers_dir`). "Extra trackers" (default: four public UDP
+trackers, `DEFAULT_EXTRA_TRACKERS`, key `options/extra_trackers`) are added
+to every torrent's `torrent_info` in tier 1 before it is added to the session. It is a C++ port
 of an earlier Python script (`libtorrent_seen_peer_collector_v2_nodeprecated.py`,
 not in this repo).
 
@@ -69,11 +73,13 @@ the binary) is gitignored. There are no tests, no CI, and no README.
 
 ## Code map (by section in the .cpp)
 
-1. **Utility helpers** (`ipPortToText`, `sortedPeerList`, `buildPeerOutputLines`,
-   `pruneSelfPeers`, …). Pure functions over `std::set<QString>` peers and
-   `std::map<QString, std::set<QString>>` peer sources. Output lines are
+1. **Utility helpers** (`ipPortToText`, `sortedPeerList`, `buildPeerRows`,
+   `parseIpInfoFields`, `pruneSelfPeers`, …). Pure functions over
+   `std::set<QString>` peers and `std::map<QString, std::set<QString>>` peer
+   sources. The worker sends `PeerRows` (`QList<PeerRow>`, registered with
+   `qRegisterMetaType` in `main`) to the GUI; the GUI formats text lines as
    `IP:port<pad># source, source; ipinfo: …` with the `#` column aligned to
-   longest endpoint + 5.
+   longest endpoint + 5 (`peersAsText`).
 2. **Direct tracker announce.** `DirectAnnounceContext` holds one peer id and
    key for the run plus the set of trackers that already got `started`.
    HTTP/HTTPS: BEP 3 URL built by hand, blocking `QNetworkAccessManager` GET
@@ -191,7 +197,7 @@ Check these before assuming the code does what its log messages claim.
   text and `docs/build-requirements.html` if packages are involved.
 - If you add a libtorrent setting, verify it exists in 2.0.x
   (`/usr/include/libtorrent/settings_pack.hpp`). Several 1.x names are gone.
-- The peers tab text is the output. `buildPeerOutputLines` is the only
-  formatter; Copy and Save both take the tab verbatim.
+- The peers table is the output. `peersAsText` is the only text formatter;
+  Copy and Save both use it, in the table's current sort order.
 - There is no automated test harness. Verify by building and running against a
   well-seeded public torrent for a short run time.

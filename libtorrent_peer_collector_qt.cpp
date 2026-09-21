@@ -45,6 +45,7 @@
 #include <QtWidgets/QFormLayout>
 #include <QtWidgets/QGridLayout>
 #include <QtWidgets/QGroupBox>
+#include <QtWidgets/QHeaderView>
 #include <QtWidgets/QHBoxLayout>
 #include <QtWidgets/QLabel>
 #include <QtWidgets/QLineEdit>
@@ -53,8 +54,10 @@
 #include <QtWidgets/QPlainTextEdit>
 #include <QtWidgets/QProgressBar>
 #include <QtWidgets/QPushButton>
+#include <QtWidgets/QScrollBar>
 #include <QtWidgets/QSpinBox>
 #include <QtWidgets/QTabWidget>
+#include <QtWidgets/QTableView>
 #include <QtWidgets/QTextBrowser>
 #include <QtWidgets/QVBoxLayout>
 #include <QtWidgets/QWidget>
@@ -76,6 +79,7 @@
 #include <QtCore/QJsonDocument>
 #include <QtCore/QRegularExpression>
 #include <QtCore/QSettings>
+#include <QtCore/QSortFilterProxyModel>
 #include <QtCore/QTemporaryDir>
 #include <QtCore/QTextStream>
 #include <QtCore/QThread>
@@ -83,6 +87,7 @@
 
 #include <QtGui/QClipboard>
 #include <QtGui/QFont>
+#include <QtGui/QStandardItemModel>
 #include <QtGui/QCloseEvent>
 #include <QtGui/QShortcut>
 #include <QtNetwork/QNetworkAccessManager>
@@ -137,6 +142,37 @@ namespace lt = libtorrent;
  */
 #define CONFIG_FOLDER_NAME      "myutils"
 #define APP_NAME                "LibtorrentPeerCollectorQt"
+
+/*
+ * Public trackers added to every torrent when the Extra trackers box is
+ * left at its default. Large, long-lived, and they answered from this
+ * machine on 2026-09-21. Torrents from private-style sites list only their
+ * own HTTP trackers; peers of those torrents often announce to public
+ * trackers as well, and this is the only way to reach that pool.
+ */
+#define DEFAULT_EXTRA_TRACKERS \
+	"udp://tracker.opentrackr.org:1337/announce\n" \
+	"udp://open.stealth.si:80/announce\n" \
+	"udp://tracker.torrent.eu.org:451/announce\n" \
+	"udp://exodus.desync.com:6969/announce\n"
+
+/* Log tab cap. A 24 h run can log hundreds of thousands of lines. */
+#define LOG_MAX_LINES           20000
+
+/*
+ * One row of the peers table, sent from the worker to the GUI. ipinfo is the
+ * formatted "ipinfo: country=.., city=.., provider=.., host=.." string,
+ * "ipinfo=pending", "ipinfo=unavailable", or empty when lookups are off.
+ */
+struct PeerRow {
+	QString endpoint;
+	QStringList sources;
+	QString ipinfo;
+};
+
+using PeerRows = QList<PeerRow>;
+
+Q_DECLARE_METATYPE(PeerRows)
 
 /* ------------------------------------------------------------------------- */
 /* Utility helpers                                                            */
@@ -282,19 +318,6 @@ static QStringList sortedPeerList(const std::set<QString> &peers)
 	return list;
 }
 
-static QString sourceSetToText(const std::set<QString> &sources)
-{
-	QStringList list;
-
-	for (const QString &s : sources) {
-		list << s;
-	}
-
-	list.sort();
-
-	return list.join(", ");
-}
-
 static QString formatPeerLineWithComment(const QString &peer,
                                              const QString &comment,
                                              int comment_column)
@@ -343,68 +366,6 @@ static QString peerIpOnly(const QString &peer)
 	return peer.left(colon).trimmed();
 }
 
-static QString buildPeerComment(const QString &peer,
-                                const std::map<QString, std::set<QString>> &peer_sources,
-                                const std::map<QString, QString> &ip_info_cache,
-                                bool include_source_comments,
-                                bool include_ipinfo_comments)
-{
-	QStringList parts;
-
-	if (include_source_comments) {
-		auto it = peer_sources.find(peer);
-
-		if (it != peer_sources.end() && !it->second.empty()) {
-			parts << sourceSetToText(it->second);
-		} else {
-			parts << "seen";
-		}
-	}
-
-	if (include_ipinfo_comments) {
-		QString ip = peerIpOnly(peer);
-		auto it = ip_info_cache.find(ip);
-
-		if (it != ip_info_cache.end() && !it->second.isEmpty()) {
-			parts << it->second;
-		} else {
-			parts << "ipinfo=pending";
-		}
-	}
-
-	return parts.join("; ");
-}
-
-static QStringList buildPeerOutputLines(const std::set<QString> &peers,
-                                        const std::map<QString, std::set<QString>> &peer_sources,
-                                        const std::map<QString, QString> &ip_info_cache,
-                                        bool include_source_comments,
-                                        bool include_ipinfo_comments)
-{
-	QStringList out;
-	QStringList list = sortedPeerList(peers);
-	int comment_column = calculatePeerCommentColumn(list);
-	bool include_any_comment = include_source_comments || include_ipinfo_comments;
-
-	for (const QString &p : list) {
-		if (include_any_comment) {
-			QString comment = buildPeerComment(
-			    p,
-			    peer_sources,
-			    ip_info_cache,
-			    include_source_comments,
-			    include_ipinfo_comments);
-
-			out << formatPeerLineWithComment(p, comment, comment_column);
-		} else {
-			out << p;
-		}
-	}
-
-	return out;
-}
-
-
 /*
  * Addresses that are this machine. Trackers return the announcing peer in
  * their reply, so without this the collector lists itself and libtorrent
@@ -442,6 +403,93 @@ static QStringList pruneSelfPeers(std::set<QString> &peers,
 	}
 
 	return removed;
+}
+
+static PeerRows buildPeerRows(const std::set<QString> &peers,
+                              const std::map<QString, std::set<QString>> &peer_sources,
+                              const std::map<QString, QString> &ip_info_cache,
+                              bool include_ipinfo)
+{
+	PeerRows rows;
+
+	for (const QString &p : sortedPeerList(peers)) {
+		PeerRow row;
+
+		row.endpoint = p;
+
+		auto sit = peer_sources.find(p);
+		if (sit != peer_sources.end()) {
+			for (const QString &src : sit->second) {
+				row.sources << src;
+			}
+			row.sources.sort();
+		}
+
+		if (include_ipinfo) {
+			auto iit = ip_info_cache.find(peerIpOnly(p));
+			row.ipinfo = (iit != ip_info_cache.end() && !iit->second.isEmpty())
+			                 ? iit->second
+			                 : QString("ipinfo=pending");
+		}
+
+		rows << row;
+	}
+
+	return rows;
+}
+
+/*
+ * Split a formatted ipinfo string back into its fields for the table. The
+ * values may themselves contain commas (an organisation name), so the split
+ * happens only before a known key.
+ */
+static void parseIpInfoFields(const QString &ipinfo,
+                              QString *country,
+                              QString *city,
+                              QString *provider,
+                              QString *host)
+{
+	static const QRegularExpression splitter(",\\s(?=(?:country|city|region|provider|host)=)");
+	QString body = ipinfo;
+
+	*country = QString();
+	*city = QString();
+	*provider = QString();
+	*host = QString();
+
+	if (body.startsWith("ipinfo: ")) {
+		body = body.mid(8);
+	} else {
+		/* ipinfo=pending / ipinfo=unavailable / anything else */
+		if (body.startsWith("ipinfo=")) {
+			*country = "(" + body.mid(7) + ")";
+		}
+		return;
+	}
+
+	for (const QString &part : body.split(splitter)) {
+		int eq = part.indexOf('=');
+		if (eq <= 0) {
+			continue;
+		}
+
+		QString key = part.left(eq);
+		QString value = part.mid(eq + 1);
+
+		if (key == "country") {
+			*country = value;
+		} else if (key == "city") {
+			*city = value;
+		} else if (key == "region") {
+			if (city->isEmpty()) {
+				*city = value;
+			}
+		} else if (key == "provider") {
+			*provider = value;
+		} else if (key == "host") {
+			*host = value;
+		}
+	}
 }
 
 static int countPeersWithSource(const std::map<QString, std::set<QString>> &peer_sources,
@@ -1782,9 +1830,11 @@ public:
 	                    bool include_source_comments,
 	                    bool include_ipinfo_comments,
 	                    const QString &ipinfo_token,
+	                    const QStringList &extra_trackers,
 	                    QObject *parent = nullptr)
 	    : QThread(parent),
 	      torrentPath(torrent_path),
+	      extraTrackers(extra_trackers),
 	      runTimeSeconds(run_time_seconds),
 	      pollIntervalMs((int)(peer_poll_interval_seconds * 1000.0)),
 	      trackerReannounceMs((int)(tracker_reannounce_interval_seconds * 1000.0)),
@@ -1825,7 +1875,7 @@ public:
 signals:
 	void logMessage(const QString &text);
 	void peerCountChanged(int count);
-	void peersPreviewChanged(const QString &text);
+	void peersChanged(const PeerRows &rows);
 	void progressChanged(int elapsed, int total);
 	void finishedStatus(bool ok, const QString &message);
 
@@ -1857,6 +1907,7 @@ protected:
 			emit logMessage("Listen port : " + QString::number(listenPort));
 			emit logMessage("No download : " + QString(noDownload ? "true" : "false"));
 			emit logMessage("Trackers    : " + QString(enableTrackers ? "enabled" : "disabled"));
+			emit logMessage("Extra trk.  : " + QString::number(extraTrackers.size()) + " configured");
 			emit logMessage("DHT         : " + QString(enableDht ? "enabled" : "disabled"));
 			emit logMessage("PEX         : " + QString(enablePex ? "enabled (ut_pex plugin), needs a connected peer" : "disabled (ut_pex plugin not loaded)"));
 			emit logMessage("LSD         : " + QString(enableLsd ? "enabled" : "disabled"));
@@ -1927,6 +1978,35 @@ protected:
 			lt::session ses(lt::session_params(pack), lt::session_flags_t{});
 
 			auto ti = std::make_shared<lt::torrent_info>(torrentPath.toStdString());
+
+			/*
+			 * Extra trackers go into the torrent_info itself, in a tier after
+			 * the torrent's own, so both libtorrent's announces and the direct
+			 * announce see them.
+			 */
+			if (enableTrackers && !extraTrackers.isEmpty()) {
+				std::set<std::string> existing;
+				int added_trackers = 0;
+
+				for (const lt::announce_entry &ae : ti->trackers()) {
+					existing.insert(ae.url);
+				}
+
+				for (const QString &t : extraTrackers) {
+					std::string url = t.trimmed().toStdString();
+
+					if (url.empty() || existing.find(url) != existing.end()) {
+						continue;
+					}
+
+					ti->add_tracker(url, 1);
+					existing.insert(url);
+					added_trackers++;
+				}
+
+				emit logMessage("Extra trackers added to torrent: " + QString::number(added_trackers)
+				                + " (torrent now has " + QString::number(ti->trackers().size()) + ")");
+			}
 
 			lt::add_torrent_params params;
 			params.ti = ti;
@@ -2257,7 +2337,7 @@ protected:
 				}
 
 				if (first_poll || timer.elapsed() - last_preview_ms >= 3000) {
-					emit peersPreviewChanged(buildPeerOutputLines(peers, peerSources, ipInfoCache, includeSourceComments, includeIpInfoComments).join("\n") + (peers.empty() ? "" : "\n"));
+					emit peersChanged(buildPeerRows(peers, peerSources, ipInfoCache, includeIpInfoComments));
 					last_preview_ms = timer.elapsed();
 				}
 
@@ -2326,7 +2406,7 @@ protected:
 
 			pruneSelfPeers(peers, peerSources, selfIps);
 
-			emit peersPreviewChanged(buildPeerOutputLines(peers, peerSources, ipInfoCache, includeSourceComments, includeIpInfoComments).join("\n") + (peers.empty() ? "" : "\n"));
+			emit peersChanged(buildPeerRows(peers, peerSources, ipInfoCache, includeIpInfoComments));
 			emit progressChanged(runTimeSeconds, runTimeSeconds);
 
 			emit logMessage("");
@@ -2343,16 +2423,17 @@ protected:
 
 		} catch (const std::exception &e) {
 			/* Whatever was collected stays visible in the peers tab. */
-			emit peersPreviewChanged(buildPeerOutputLines(peers, peerSources, ipInfoCache, includeSourceComments, includeIpInfoComments).join("\n") + (peers.empty() ? "" : "\n"));
+			emit peersChanged(buildPeerRows(peers, peerSources, ipInfoCache, includeIpInfoComments));
 			emit finishedStatus(false, "Exception: " + QString::fromUtf8(e.what()));
 		} catch (...) {
-			emit peersPreviewChanged(buildPeerOutputLines(peers, peerSources, ipInfoCache, includeSourceComments, includeIpInfoComments).join("\n") + (peers.empty() ? "" : "\n"));
+			emit peersChanged(buildPeerRows(peers, peerSources, ipInfoCache, includeIpInfoComments));
 			emit finishedStatus(false, "Unknown exception.");
 		}
 	}
 
 private:
 	QString torrentPath;
+	QStringList extraTrackers;
 	int runTimeSeconds;
 	int pollIntervalMs;
 	int trackerReannounceMs;
@@ -2487,7 +2568,21 @@ private:
 	QPointer<QDialog> helpDialog;
 
 	QPlainTextEdit *logText = nullptr;
-	QPlainTextEdit *peersText = nullptr;
+	QTableView *peersTable = nullptr;
+	QStandardItemModel *peersModel = nullptr;
+	QSortFilterProxyModel *peersProxy = nullptr;
+	QPlainTextEdit *extraTrackersEdit = nullptr;
+
+	enum PeerColumn {
+		COL_IP = 0,
+		COL_PORT,
+		COL_SOURCES,
+		COL_COUNTRY,
+		COL_CITY,
+		COL_PROVIDER,
+		COL_HOST,
+		COL_COUNT
+	};
 	QTabWidget *tabs = nullptr;
 	QProgressBar *progress = nullptr;
 	QLabel *progressTextLabel = nullptr;
@@ -2581,6 +2676,14 @@ private:
 		ipInfoTokenEdit->setEchoMode(QLineEdit::Password);
 		ipInfoTokenEdit->setToolTip("Optional. Leave blank to try IPinfo without a token. Token is not saved.");
 
+		extraTrackersEdit = new QPlainTextEdit(group);
+		extraTrackersEdit->setPlaceholderText("One tracker URL per line. Added to every torrent, after its own trackers.");
+		extraTrackersEdit->setToolTip(
+		    "Trackers added to every torrent you load, in a tier after the torrent's own.\n"
+		    "Lines starting with # are ignored. Clear the box to add none.");
+		extraTrackersEdit->setMaximumHeight(4 * extraTrackersEdit->fontMetrics().lineSpacing() + 12);
+		extraTrackersEdit->setLineWrapMode(QPlainTextEdit::NoWrap);
+
 		form->addRow("Run time:", runTimeSpin);
 		form->addRow("Peer poll interval:", pollSpin);
 		form->addRow("Tracker reannounce interval:", trackerReannounceSpin);
@@ -2591,6 +2694,7 @@ private:
 		form->addRow("", dhtCheck);
 		form->addRow("", pexCheck);
 		form->addRow("", lsdCheck);
+		form->addRow("Extra trackers:", extraTrackersEdit);
 		form->addRow("Comments:", sourceCommentsCheck);
 		form->addRow("", ipInfoCommentsCheck);
 		form->addRow("IPinfo token:", ipInfoTokenEdit);
@@ -2711,11 +2815,12 @@ private:
 		    "sees: peers returned by trackers, found through DHT, exchanged over "
 		    "PEX, discovered on the local network, and every peer libtorrent "
 		    "tries to connect to, whether the connection succeeds or not.</p>"
-		    "<p>The result is a plain text list in the Seen / Known Peers tab, one "
-		    "<tt>IP:port</tt> per line, with an optional comment saying where "
-		    "each peer was seen. Nothing is written to disk on its own: "
-		    "<b>Copy Peers</b> puts the list on the clipboard and "
-		    "<b>Save Peers...</b> writes it to a file you pick.</p>"
+		    "<p>The result is the Seen / Known Peers table: IP, port, where each "
+		    "peer was seen and, if enabled, IPinfo location and provider. Click "
+		    "a header to sort. Nothing is written to disk on its own: "
+		    "<b>Copy Peers</b> puts the list on the clipboard as text and "
+		    "<b>Save Peers...</b> writes the same text to a file you pick, both "
+		    "in the table's current order.</p>"
 		    "<h3>The usual flow</h3>"
 		    "<ol>"
 		    "<li>Choose a <b>Torrent file</b>.</li>"
@@ -2773,6 +2878,15 @@ private:
 		    "are swapped with connected peers. PEX only works after at least one "
 		    "peer is connected, so it needs Trackers, DHT or LSD.</td></tr>"
 		    "<tr><td><b>LSD</b></td><td>Local service discovery on the LAN.</td></tr>"
+		    "<tr><td><b>Extra trackers</b></td><td>One URL per line, added to "
+		    "every torrent you load in a tier after its own trackers, for both "
+		    "libtorrent's announces and the direct announce. The default is four "
+		    "large public UDP trackers. Torrents from private-style sites list "
+		    "only their own HTTP trackers, while many of their peers also "
+		    "announce to public ones; this is how to reach that pool. A tracker "
+		    "that does not know the torrent answers with 0 seeders and 0 "
+		    "leechers, visible in the Log. Lines starting with # are ignored; "
+		    "an empty box adds nothing.</td></tr>"
 		    "</table>"
 		    "<h3>Comments</h3>"
 		    "<table cellpadding='3' cellspacing='0'>"
@@ -2838,8 +2952,13 @@ private:
 		    "usually most of a long run's list.</p>");
 
 		addHelpPage(pages, "Output",
-		    "<h3>List format</h3>"
-		    "<p>One peer per line, sorted by IP address and then port. With "
+		    "<h3>The table</h3>"
+		    "<p>One row per peer. IP and Port sort numerically, the other "
+		    "columns alphabetically. Rows can be selected; selection and "
+		    "scroll position survive the refresh every 3 seconds. The IPinfo "
+		    "columns are hidden when IPinfo comments are off.</p>"
+		    "<h3>Text format of Copy and Save</h3>"
+		    "<p>One peer per line in the table's current order. With "
 		    "comments enabled every line looks like:</p>"
 		    "<pre>1.2.3.4:6881      # peer-connect-out; ipinfo: country=DE, city=Berlin, provider=AS3320 Deutsche Telekom</pre>"
 		    "<p>The <tt>#</tt> column is aligned: it starts five characters past "
@@ -2860,7 +2979,8 @@ private:
 		    "</table>"
 		    "<h3>Summary</h3>"
 		    "<p>When a run ends the Log tab shows a summary with the unique "
-		    "total and a count per source tag.</p>");
+		    "total and a count per source tag. The Log keeps the last "
+		    "20,000 lines; older ones drop off the top.</p>");
 
 		addHelpPage(pages, "Shortcuts",
 		    "<h3>Keyboard</h3>"
@@ -2897,20 +3017,50 @@ private:
 		tabs = new QTabWidget(this);
 
 		logText = new QPlainTextEdit(tabs);
-		peersText = new QPlainTextEdit(tabs);
 
 		QFont monoFont("monospace");
 		monoFont.setStyleHint(QFont::Monospace);
 		monoFont.setFixedPitch(true);
 
 		logText->setFont(monoFont);
-		peersText->setFont(monoFont);
-
 		logText->setReadOnly(true);
-		peersText->setReadOnly(true);
+		logText->setMaximumBlockCount(LOG_MAX_LINES);
+
+		/*
+		 * Peers are a table: sortable by any column, rows selectable, and the
+		 * 3 second refresh keeps selection and scroll position. Sorting goes
+		 * through a proxy on Qt::UserRole so IPs and ports sort numerically.
+		 */
+		peersModel = new QStandardItemModel(0, COL_COUNT, this);
+		peersModel->setHorizontalHeaderLabels(
+		    {"IP", "Port", "Sources", "Country", "City", "Provider", "Host"});
+
+		peersProxy = new QSortFilterProxyModel(this);
+		peersProxy->setSourceModel(peersModel);
+		peersProxy->setSortRole(Qt::UserRole);
+
+		peersTable = new QTableView(tabs);
+		peersTable->setModel(peersProxy);
+		peersTable->setSortingEnabled(true);
+		peersTable->sortByColumn(COL_IP, Qt::AscendingOrder);
+		peersTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+		peersTable->setSelectionMode(QAbstractItemView::ExtendedSelection);
+		peersTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+		peersTable->setAlternatingRowColors(true);
+		peersTable->setWordWrap(false);
+		peersTable->verticalHeader()->setVisible(false);
+		peersTable->verticalHeader()->setDefaultSectionSize(peersTable->fontMetrics().height() + 6);
+		peersTable->horizontalHeader()->setStretchLastSection(true);
+		peersTable->horizontalHeader()->setHighlightSections(false);
+		peersTable->setColumnWidth(COL_IP, 130);
+		peersTable->setColumnWidth(COL_PORT, 60);
+		peersTable->setColumnWidth(COL_SOURCES, 260);
+		peersTable->setColumnWidth(COL_COUNTRY, 90);
+		peersTable->setColumnWidth(COL_CITY, 140);
+		peersTable->setColumnWidth(COL_PROVIDER, 220);
 
 		tabs->addTab(logText, "Log");
-		tabs->addTab(peersText, "Seen / Known Peers");
+		tabs->addTab(peersTable, "Seen / Known Peers");
 
 		parent->addWidget(tabs, 1);
 	}
@@ -2927,6 +3077,7 @@ private:
 
 		torrentPathEdit->setText(settings.value("paths/torrent", "").toString());
 		lastPeersDir = settings.value("paths/peers_dir", "").toString();
+		extraTrackersEdit->setPlainText(settings.value("options/extra_trackers", QString(DEFAULT_EXTRA_TRACKERS)).toString());
 		runTimeSpin->setValue(settings.value("options/run_time", 300).toInt());
 		pollSpin->setValue(settings.value("options/poll_interval", 2.0).toDouble());
 		trackerReannounceSpin->setValue(settings.value("options/tracker_reannounce_interval", 300.0).toDouble());
@@ -2953,6 +3104,7 @@ private:
 	{
 		settings.setValue("paths/torrent", torrentPathEdit->text().trimmed());
 		settings.setValue("paths/peers_dir", lastPeersDir);
+		settings.setValue("options/extra_trackers", extraTrackersEdit->toPlainText());
 		settings.setValue("options/run_time", runTimeSpin->value());
 		settings.setValue("options/poll_interval", pollSpin->value());
 		settings.setValue("options/tracker_reannounce_interval", trackerReannounceSpin->value());
@@ -3055,7 +3207,7 @@ private slots:
 		QString text;
 		QFile f;
 
-		text = peersText->toPlainText();
+		text = peersAsText();
 
 		if (text.trimmed().isEmpty()) {
 			QMessageBox::information(this, "Nothing to save", "The peer list is empty.");
@@ -3125,7 +3277,8 @@ private slots:
 		saveSettings();
 
 		logText->clear();
-		peersText->clear();
+		peersModel->removeRows(0, peersModel->rowCount());
+		setIpInfoColumnsVisible(ipInfoCommentsCheck->isChecked());
 		progress->setValue(0);
 		progress->setFormat("0%");
 		progressTextLabel->setText("Elapsed: 00:00:00    Remaining: --:--:--");
@@ -3146,11 +3299,12 @@ private slots:
 		    sourceCommentsCheck->isChecked(),
 		    ipInfoCommentsCheck->isChecked(),
 		    ipInfoTokenEdit->text().trimmed(),
+		    trackersCheck->isChecked() ? extraTrackerList() : QStringList(),
 		    this);
 
 		connect(worker, &PeerCollectorThread::logMessage, this, &MainWindow::appendLog);
 		connect(worker, &PeerCollectorThread::peerCountChanged, this, &MainWindow::setPeerCount);
-		connect(worker, &PeerCollectorThread::peersPreviewChanged, this, &MainWindow::setPeersText);
+		connect(worker, &PeerCollectorThread::peersChanged, this, &MainWindow::setPeerRows);
 		connect(worker, &PeerCollectorThread::progressChanged, this, &MainWindow::setProgress);
 		connect(worker, &PeerCollectorThread::finishedStatus, this, &MainWindow::collectionFinished);
 		connect(worker, &QThread::finished, worker, &QObject::deleteLater);
@@ -3185,9 +3339,140 @@ private slots:
 		statusLabel->setText("Running. Unique seen/known peers: " + QString::number(count));
 	}
 
-	void setPeersText(const QString &text)
+	/* Extra trackers box as a clean list: trimmed, no blanks, no # comments. */
+	QStringList extraTrackerList() const
 	{
-		peersText->setPlainText(text);
+		QStringList out;
+
+		for (const QString &line : extraTrackersEdit->toPlainText().split('\n')) {
+			QString t = line.trimmed();
+
+			if (!t.isEmpty() && !t.startsWith('#')) {
+				out << t;
+			}
+		}
+
+		return out;
+	}
+
+	void setIpInfoColumnsVisible(bool visible)
+	{
+		peersTable->setColumnHidden(COL_COUNTRY, !visible);
+		peersTable->setColumnHidden(COL_CITY, !visible);
+		peersTable->setColumnHidden(COL_PROVIDER, !visible);
+		peersTable->setColumnHidden(COL_HOST, !visible);
+	}
+
+	/*
+	 * Rebuild the table from the worker's rows, keeping what the user had:
+	 * selected endpoints and the scroll position. The full PeerRow is kept in
+	 * Qt::UserRole + 1 of the IP cell so Copy/Save can rebuild the text in
+	 * the table's current order.
+	 */
+	void setPeerRows(const PeerRows &rows)
+	{
+		QSet<QString> selected;
+		int scroll = peersTable->verticalScrollBar()->value();
+
+		for (const QModelIndex &idx : peersTable->selectionModel()->selectedRows(COL_IP)) {
+			selected.insert(peersProxy->mapToSource(idx).data(Qt::UserRole + 2).toString());
+		}
+
+		peersModel->removeRows(0, peersModel->rowCount());
+
+		for (const PeerRow &row : rows) {
+			QString country, city, provider, host;
+			quint32 ip_key = 0;
+			quint16 port_key = 0;
+			QList<QStandardItem *> items;
+
+			ipv4PortToSortKey(row.endpoint, &ip_key, &port_key);
+			parseIpInfoFields(row.ipinfo, &country, &city, &provider, &host);
+
+			QStandardItem *ip_item = new QStandardItem(peerIpOnly(row.endpoint));
+			ip_item->setData(ip_key, Qt::UserRole);
+			ip_item->setData(row.sources.join(", "), Qt::UserRole + 1);
+			ip_item->setData(row.endpoint, Qt::UserRole + 2);
+			ip_item->setData(row.ipinfo, Qt::UserRole + 3);
+
+			QStandardItem *port_item = new QStandardItem(QString::number(port_key));
+			port_item->setData((uint)port_key, Qt::UserRole);
+			port_item->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+
+			items << ip_item << port_item;
+
+			for (const QString &text : {row.sources.join(", "), country, city, provider, host}) {
+				QStandardItem *it = new QStandardItem(text);
+				it->setData(text.toLower(), Qt::UserRole);
+				items << it;
+			}
+
+			peersModel->appendRow(items);
+		}
+
+		if (!selected.isEmpty()) {
+			QItemSelection sel;
+
+			for (int r = 0; r < peersProxy->rowCount(); r++) {
+				QModelIndex idx = peersProxy->index(r, COL_IP);
+
+				if (selected.contains(peersProxy->mapToSource(idx).data(Qt::UserRole + 2).toString())) {
+					sel.select(idx, peersProxy->index(r, COL_COUNT - 1));
+				}
+			}
+
+			peersTable->selectionModel()->select(sel, QItemSelectionModel::Select | QItemSelectionModel::Rows);
+		}
+
+		peersTable->verticalScrollBar()->setValue(scroll);
+	}
+
+	/*
+	 * The peers as text, one per line in the table's current order, in the
+	 * same format the tool has always produced: IP:port, then an aligned
+	 * "# sources; ipinfo" comment when those options are on.
+	 */
+	QString peersAsText() const
+	{
+		QStringList endpoints;
+		QStringList comments;
+		QStringList lines;
+		bool with_sources = sourceCommentsCheck->isChecked();
+		bool with_ipinfo = ipInfoCommentsCheck->isChecked();
+		int column;
+
+		for (int r = 0; r < peersProxy->rowCount(); r++) {
+			QModelIndex src = peersProxy->mapToSource(peersProxy->index(r, COL_IP));
+			QStringList parts;
+
+			endpoints << src.data(Qt::UserRole + 2).toString();
+
+			if (with_sources) {
+				QString sources = src.data(Qt::UserRole + 1).toString();
+				parts << (sources.isEmpty() ? QString("seen") : sources);
+			}
+
+			if (with_ipinfo) {
+				QString ipinfo = src.data(Qt::UserRole + 3).toString();
+				if (!ipinfo.isEmpty()) {
+					parts << ipinfo;
+				}
+			}
+
+			comments << parts.join("; ");
+		}
+
+		column = calculatePeerCommentColumn(endpoints);
+
+		for (int i = 0; i < endpoints.size(); i++) {
+			if (comments[i].isEmpty()) {
+				lines << endpoints[i];
+			} else {
+				lines << formatPeerLineWithComment(endpoints[i], comments[i], column);
+			}
+		}
+
+		return lines.isEmpty() ? QString() : lines.join("\n") + "\n";
 	}
 
 	void setProgress(int elapsed, int total)
@@ -3247,8 +3532,10 @@ private slots:
 
 	void copyPeers()
 	{
-		QApplication::clipboard()->setText(peersText->toPlainText());
-		statusLabel->setText("Peers copied to clipboard.");
+		QString text = peersAsText();
+
+		QApplication::clipboard()->setText(text);
+		statusLabel->setText(QString("%1 peer(s) copied to clipboard.").arg(text.count('\n')));
 	}
 };
 
@@ -3264,6 +3551,9 @@ int main(int argc, char **argv)
 	 */
 	QCoreApplication::setOrganizationName(CONFIG_FOLDER_NAME);
 	QCoreApplication::setApplicationName(APP_NAME);
+
+	/* Worker -> GUI signal payload, delivered through the queued connection. */
+	qRegisterMetaType<PeerRows>("PeerRows");
 
 	MainWindow win;
 
