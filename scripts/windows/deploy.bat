@@ -34,9 +34,12 @@ rem                     the compiler runtime DLLs
 rem                     (default: g++.exe in PATH, then
 rem                      C:\Qt\Tools\mingw1310_64\bin)
 rem     PKG_CONFIG      pkg-config executable (default: pkg-config.exe in PATH)
-rem     LIBTORRENT_BIN  folder holding libtorrent-rasterbar*.dll, libssl*.dll
-rem                     and libcrypto*.dll
+rem     LIBTORRENT_BIN  folder holding libtorrent-rasterbar*.dll
 rem                     (default: <pkg-config prefix of libtorrent>\bin)
+rem     OPENSSL_BIN     folder holding libssl*.dll and libcrypto*.dll
+rem                     (default: LIBTORRENT_BIN if they are there, then the
+rem                      Qt Maintenance Tool's OpenSSL Toolkit at
+rem                      C:\Qt\Tools\OpenSSLv3\Win_x64\bin)
 rem ============================================================================
 
 pushd "%~dp0..\.."
@@ -128,6 +131,21 @@ if defined LIBTORRENT_BIN (
     set "LIBTORRENT_BIN=!LIBTORRENT_BIN:/=\!"
 )
 
+rem ---- locate the OpenSSL DLL folder ----
+rem An MSYS2 libtorrent has OpenSSL beside it. A libtorrent built with Qt's
+rem MinGW against the Maintenance Tool's OpenSSL Toolkit does not, so fall
+rem back to that toolkit's bin folder.
+if not defined OPENSSL_BIN (
+    if defined LIBTORRENT_BIN (
+        for %%F in ("!LIBTORRENT_BIN!\libssl*.dll") do (
+            if exist "%%~F" if not defined OPENSSL_BIN set "OPENSSL_BIN=!LIBTORRENT_BIN!"
+        )
+    )
+)
+if not defined OPENSSL_BIN (
+    if exist "C:\Qt\Tools\OpenSSLv3\Win_x64\bin\libssl-3-x64.dll" set "OPENSSL_BIN=C:\Qt\Tools\OpenSSLv3\Win_x64\bin"
+)
+
 rem ---- locate the executable to deploy ----
 rem Candidates, in order: what build.bat produces, the release subfolder a
 rem debug_and_release build would use, and anything else under build\.
@@ -167,6 +185,11 @@ if defined LIBTORRENT_BIN (
     echo libtorrent bin: %LIBTORRENT_BIN%
 ) else (
     echo libtorrent bin: not found ^(set LIBTORRENT_BIN^)
+)
+if defined OPENSSL_BIN (
+    echo OpenSSL bin:    %OPENSSL_BIN%
+) else (
+    echo OpenSSL bin:    not found ^(set OPENSSL_BIN^)
 )
 echo Deploy to:      %DEPLOY_DIR%
 echo.
@@ -221,22 +244,10 @@ rem ---- libtorrent and OpenSSL ----
 rem windeployqt does not copy these. Missing ones only warn, because the
 rem target machine may have them on PATH already.
 set "MISSING_DLLS="
-if defined LIBTORRENT_BIN (
-    echo Copying libtorrent and OpenSSL DLLs...
-    for %%N in (libtorrent-rasterbar libssl libcrypto) do (
-        set "FOUND_ONE="
-        for %%F in ("!LIBTORRENT_BIN!\%%N*.dll") do (
-            if exist "%%~F" (
-                copy /y "%%~F" . >nul
-                echo     %%~nxF
-                set "FOUND_ONE=1"
-            )
-        )
-        if not defined FOUND_ONE set "MISSING_DLLS=!MISSING_DLLS! %%N"
-    )
-) else (
-    set "MISSING_DLLS= libtorrent-rasterbar libssl libcrypto"
-)
+echo Copying libtorrent and OpenSSL DLLs...
+call :copy_dlls "libtorrent-rasterbar" "%LIBTORRENT_BIN%"
+call :copy_dlls "libssl" "%OPENSSL_BIN%"
+call :copy_dlls "libcrypto" "%OPENSSL_BIN%"
 popd
 
 echo.
@@ -246,9 +257,32 @@ if defined MISSING_DLLS (
     echo.
     echo WARNING: these DLLs were not copied:%MISSING_DLLS%
     echo WARNING: the executable needs them on the target machine. Set
-    echo WARNING: LIBTORRENT_BIN to the folder that holds them and rerun.
+    echo WARNING: LIBTORRENT_BIN and/or OPENSSL_BIN to the folders that hold
+    echo WARNING: them and rerun.
 )
 echo.
+
+goto :done
+
+rem Copies every <name>*.dll from a folder into the current directory and
+rem appends <name> to MISSING_DLLS when none was found or the folder is unset.
+rem     %1  DLL name prefix
+rem     %2  folder, may be empty
+:copy_dlls
+set "FOUND_ONE="
+if not "%~2"=="" (
+    for %%F in ("%~2\%~1*.dll") do (
+        if exist "%%~F" (
+            copy /y "%%~F" . >nul
+            echo     %%~nxF
+            set "FOUND_ONE=1"
+        )
+    )
+)
+if not defined FOUND_ONE set "MISSING_DLLS=!MISSING_DLLS! %~1"
+goto :eof
+
+:done
 
 echo %cmdcmdline% | find /i "%~nx0" >nul
 if not errorlevel 1 pause

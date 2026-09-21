@@ -124,19 +124,21 @@ if not defined PKG_CONFIG (
 )
 if not defined PKG_CONFIG (
     echo ERROR: pkg-config.exe was not found in PATH.
-    echo The project links libtorrent-rasterbar through pkg-config.
-    echo Install pkg-config and a MinGW build of libtorrent, for example with MSYS2:
-    echo     pacman -S mingw-w64-x86_64-pkgconf mingw-w64-x86_64-libtorrent-rasterbar
-    echo and put C:\msys64\mingw64\bin on PATH, or set PKG_CONFIG to pkg-config.exe.
+    echo The project links libtorrent-rasterbar through pkg-config, which the
+    echo Qt Maintenance Tool does not provide. Install a small one, for example:
+    echo     choco install pkgconfiglite
+    echo or put pkg-config-lite's pkg-config.exe on PATH, or set PKG_CONFIG to it.
+    echo See docs\build-requirements.html, section Windows.
     exit /b 1
 )
 
 "%PKG_CONFIG%" --exists libtorrent-rasterbar
 if errorlevel 1 (
     echo ERROR: pkg-config cannot find libtorrent-rasterbar.
-    echo Set PKG_CONFIG_PATH to the folder that holds libtorrent-rasterbar.pc,
-    echo for example:
-    echo     set PKG_CONFIG_PATH=C:\msys64\mingw64\lib\pkgconfig
+    echo libtorrent is not part of Qt; it is built once from source with Qt's
+    echo MinGW ^(see docs\build-requirements.html, section Windows^). Then set
+    echo PKG_CONFIG_PATH to the folder that holds libtorrent-rasterbar.pc:
+    echo     set PKG_CONFIG_PATH=C:\libtorrent\lib\pkgconfig
     exit /b 1
 )
 

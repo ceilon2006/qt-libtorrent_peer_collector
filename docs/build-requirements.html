@@ -357,6 +357,8 @@ make</code></pre>
 
 <p>Instead of the distribution packages, Qt can come from Qt's own installer. That gives a newer Qt and a matching Qt Creator, and it is the normal way on Windows. The first install is done with the <b>Qt Online Installer</b> from <code>qt.io/download-open-source</code>; every later change goes through the <b>Qt Maintenance Tool</b> it leaves behind. Both need a free Qt account.</p>
 
+<p>This section covers the Linux side and the component tree in general. The complete Windows procedure, including the extra Maintenance Tool components libtorrent needs, is in the <a href="#windows">Windows</a> section.</p>
+
 <div class="table-wrap">
 <table>
 <thead>
@@ -447,38 +449,113 @@ scripts/linux/build.sh</code></pre>
 
 <h2 id="windows">Windows</h2>
 
-<p>The Qt side is the same as for any Qt Widgets program and can be installed with the Maintenance Tool as described above. The difference is libtorrent: the Qt Online Installer does not ship it, and the <code>.pro</code> file finds it through <code>pkg-config</code>, which the Qt installer does not ship either.</p>
+<p>The Qt side is the same as for any Qt Widgets program and is installed with the Qt Maintenance Tool. The difference is libtorrent: the Maintenance Tool does not ship it, and the <code>.pro</code> file finds it through <code>pkg-config</code>, which the Maintenance Tool does not ship either. So a Windows build is: Qt and the toolchain from the Maintenance Tool, libtorrent built once from source with that same toolchain, and a small <code>pkg-config.exe</code> so qmake can find it.</p>
 
-<h3>Recommended: everything from MSYS2</h3>
+<div class="note">
+<p>The Windows scripts default to the Maintenance Tool layout: <code>C:\Qt\6.11.1\mingw_64</code>, <code>C:\Qt\Tools\mingw1310_64</code> and <code>C:\Qt\Tools\OpenSSLv3\Win_x64</code>. Set <code>QMAKE</code>, <code>MAKE</code>, <code>MINGW_BIN</code> or <code>OPENSSL_BIN</code> if your versions differ. These steps follow the pattern used for the sibling Qt projects on this machine but have not been run from this repository on Windows.</p>
+</div>
 
-<p>MSYS2 packages Qt 6, libtorrent, Boost, OpenSSL, pkg-config and the MinGW toolchain, all built with the same compiler, so they link together without surprises.</p>
+<h3>Step 1: Qt components in the Maintenance Tool</h3>
 
-<ol>
-<li>Install MSYS2 from <code>msys2.org</code>.</li>
-<li>Open the <b>MSYS2 MINGW64</b> shell and install:</li>
-</ol>
+<p>Run <code>C:\Qt\MaintenanceTool.exe</code>, choose <b>Add or remove components</b>, and make sure these are ticked. On a first install the Qt Online Installer shows the same tree.</p>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>Tree entry</th><th>Needed</th><th>Why</th></tr>
+</thead>
+<tbody>
+<tr><td>Qt &rarr; Qt 6.x.y &rarr; <b>MinGW 64-bit</b></td><td>yes</td><td>Qt libraries, headers, <code>qmake6.exe</code>, <code>moc.exe</code>, <code>windeployqt.exe</code>. Core, Gui, Widgets and Network are all inside this one entry. Pick MinGW, not MSVC, so it matches the MinGW libtorrent below.</td></tr>
+<tr><td>Qt &rarr; Developer and Designer Tools &rarr; <b>MinGW 13.1.0 64-bit</b></td><td>yes</td><td>The compiler and <code>mingw32-make.exe</code>. Take the version the Qt build above was made with; the installer pre-selects it.</td></tr>
+<tr><td>Qt &rarr; Developer and Designer Tools &rarr; <b>CMake</b></td><td>yes, for libtorrent</td><td>libtorrent is built with CMake. The project itself does not use it.</td></tr>
+<tr><td>Qt &rarr; Developer and Designer Tools &rarr; <b>Ninja</b></td><td>yes, for libtorrent</td><td>Build tool CMake drives. Faster than mingw32-make for libtorrent.</td></tr>
+<tr><td>Qt &rarr; Developer and Designer Tools &rarr; <b>OpenSSL 3.x Toolkit</b></td><td>yes, for libtorrent</td><td>Prebuilt OpenSSL headers, import libraries and DLLs. libtorrent needs them; the app itself does not link them directly.</td></tr>
+<tr><td>Qt &rarr; Developer and Designer Tools &rarr; <b>Qt Creator</b></td><td>optional</td><td>IDE. Not needed for the scripts.</td></tr>
+<tr><td>Qt &rarr; Qt 6.x.y &rarr; Additional Libraries &rarr; anything</td><td>no</td><td>Widgets and Network are part of the base module.</td></tr>
+<tr><td>Qt &rarr; Qt 6.x.y &rarr; Sources, Qt Debug Information Files, MSVC, WebAssembly, Android</td><td>no</td><td>Not used.</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>After this the folders below exist. The exact version numbers depend on what you picked.</p>
+
+<pre><code>C:\Qt\6.11.1\mingw_64\bin\qmake6.exe
+C:\Qt\6.11.1\mingw_64\bin\windeployqt.exe
+C:\Qt\Tools\mingw1310_64\bin\g++.exe
+C:\Qt\Tools\CMake_64\bin\cmake.exe
+C:\Qt\Tools\Ninja\ninja.exe
+C:\Qt\Tools\OpenSSLv3\Win_x64\bin\libssl-3-x64.dll
+C:\Qt\Tools\OpenSSLv3\Win_x64\bin\libcrypto-3-x64.dll</code></pre>
+
+<h3>Step 2: Boost headers</h3>
+
+<p>libtorrent 2.0 needs only the Boost headers, no compiled Boost libraries. Download the <code>boost_1_xx_0.zip</code> archive from <code>boost.org</code> and extract it so that <code>C:\boost\boost\asio.hpp</code> exists. Nothing to build.</p>
+
+<h3>Step 3: build libtorrent once with Qt's MinGW</h3>
+
+<p>Open a Command Prompt, put Qt's toolchain first on <code>PATH</code>, and build a shared libtorrent into <code>C:\libtorrent</code>:</p>
+
+<pre><code>set PATH=C:\Qt\Tools\mingw1310_64\bin;C:\Qt\Tools\CMake_64\bin;C:\Qt\Tools\Ninja;%PATH%
+
+git clone --branch RC_2_0 --depth 1 --recurse-submodules https://github.com/arvidn/libtorrent.git C:\src\libtorrent
+cd C:\src\libtorrent
+
+cmake -S . -B build -G Ninja ^
+    -DCMAKE_BUILD_TYPE=Release ^
+    -DBUILD_SHARED_LIBS=ON ^
+    -DCMAKE_INSTALL_PREFIX=C:/libtorrent ^
+    -DBOOST_ROOT=C:/boost ^
+    -DOPENSSL_ROOT_DIR=C:/Qt/Tools/OpenSSLv3/Win_x64 ^
+    -Dpython-bindings=OFF -Dbuild_tests=OFF -Dbuild_examples=OFF -Dbuild_tools=OFF
+
+cmake --build build
+cmake --install build</code></pre>
+
+<p>The install writes <code>C:\libtorrent\bin\libtorrent-rasterbar.dll</code>, the headers, and <code>C:\libtorrent\lib\pkgconfig\libtorrent-rasterbar.pc</code>. That <code>.pc</code> file carries the compile definitions libtorrent was built with, which is why the project reads it through pkg-config instead of hard-coding paths: the definitions must match or the program will not work.</p>
+
+<div class="warn">
+<p>Build libtorrent with the same MinGW the Maintenance Tool installed for Qt. A libtorrent from MSYS2, vcpkg's default triplets or another GCC uses a different C runtime or standard library and will fail to link or crash at start-up.</p>
+</div>
+
+<h3>Step 4: pkg-config</h3>
+
+<p>Any small <code>pkg-config.exe</code> works; it only has to read the <code>.pc</code> file. Two easy sources:</p>
+
+<pre><code>choco install pkgconfiglite</code></pre>
+
+<p>or download <code>pkg-config-lite</code> from SourceForge and put <code>pkg-config.exe</code> somewhere on <code>PATH</code>. Then tell it where the libtorrent <code>.pc</code> file is, for the current shell or permanently in the system environment variables:</p>
+
+<pre><code>set PKG_CONFIG_PATH=C:\libtorrent\lib\pkgconfig
+pkg-config --modversion libtorrent-rasterbar</code></pre>
+
+<h3>Step 5: build and deploy the project</h3>
+
+<pre><code>scripts\windows\build.bat            rem release into build\
+scripts\windows\build.bat debug      rem debug into build-debug\
+scripts\windows\rebuild.bat          rem clean, then build
+scripts\windows\clean.bat            rem remove everything generated
+scripts\windows\deploy.bat           rem deploy\ with all DLLs, ready to copy elsewhere</code></pre>
+
+<p><code>build.bat</code> finds qmake and MinGW in the default Maintenance Tool folders on its own. It checks for <code>pkg-config.exe</code> and for <code>libtorrent-rasterbar</code> before it starts and stops with a message naming what is missing.</p>
+
+<p><code>deploy.bat</code> runs <code>windeployqt</code> for the Qt DLLs, then copies <code>libtorrent-rasterbar.dll</code> from <code>C:\libtorrent\bin</code> (found through <code>pkg-config --variable=prefix</code>) and the two OpenSSL DLLs from the Maintenance Tool's OpenSSL folder. Override with <code>LIBTORRENT_BIN</code> or <code>OPENSSL_BIN</code> if they live elsewhere. The resulting <code>deploy\</code> folder runs on a machine with nothing installed.</p>
+
+<h3>Alternative: everything from MSYS2</h3>
+
+<p>If you would rather not build libtorrent yourself, MSYS2 packages Qt 6, libtorrent, Boost, OpenSSL, pkg-config and a MinGW toolchain, all built together. Install MSYS2 from <code>msys2.org</code>, open the <b>MSYS2 MINGW64</b> shell and run:</p>
+
 <pre><code>pacman -S --needed mingw-w64-x86_64-toolchain mingw-w64-x86_64-pkgconf \
     mingw-w64-x86_64-qt6-base mingw-w64-x86_64-qt6-tools \
     mingw-w64-x86_64-libtorrent-rasterbar</code></pre>
-<ol start="3">
-<li>Build from a normal Command Prompt with the MinGW64 bin folder on <code>PATH</code>, or straight from the MINGW64 shell:</li>
-</ol>
+
+<p>Then build with the MinGW64 bin folder first on <code>PATH</code> so the scripts pick up MSYS2's qmake, compiler and pkg-config instead of the Maintenance Tool ones:</p>
+
 <pre><code>set PATH=C:\msys64\mingw64\bin;%PATH%
+set QT_DEPLOY=C:\msys64\mingw64\bin\windeployqt6.exe
 scripts\windows\build.bat
 scripts\windows\deploy.bat</code></pre>
 
-<div class="note">
-<p><code>deploy.bat</code> runs <code>windeployqt</code> for the Qt DLLs and then copies <code>libtorrent-rasterbar</code>, <code>libssl</code> and <code>libcrypto</code> from the folder <code>pkg-config --variable=prefix libtorrent-rasterbar</code> points at. If MSYS2 only installs <code>windeployqt6.exe</code>, set <code>QT_DEPLOY=C:\msys64\mingw64\bin\windeployqt6.exe</code> first.</p>
-</div>
-
-<h3>Alternative: Qt Online Installer plus your own libtorrent</h3>
-
-<p>Install Qt with the Maintenance Tool, ticking the Windows column of the component table above: <b>MinGW 64-bit</b> under Qt 6.x.y and <b>MinGW 13.x 64-bit</b> under Developer and Designer Tools. The scripts look for that layout by default (<code>C:\Qt\6.11.1\mingw_64</code> and <code>C:\Qt\Tools\mingw1310_64</code>); set <code>QMAKE</code>, <code>MAKE</code> or <code>MINGW_BIN</code> if yours differs.</p>
-
-<div class="warn">
-<p>libtorrent, Boost and OpenSSL must then come from somewhere else (vcpkg with the <code>x64-mingw-dynamic</code> triplet, or a source build) and must be compiled with a MinGW that is ABI-compatible with the one Qt ships. Mixing MSYS2's libtorrent with the Qt installer's Qt usually fails at link or start-up. That is why the all-MSYS2 route is recommended.</p>
-<p>Whichever route you take, <code>pkg-config.exe</code> must be on <code>PATH</code> and <code>PKG_CONFIG_PATH</code> must contain the folder with <code>libtorrent-rasterbar.pc</code>. <code>build.bat</code> checks both and stops with a message if either is missing.</p>
-</div>
+<p>Do not mix the two routes. Qt from the Maintenance Tool with libtorrent from MSYS2, or the other way round, does not link.</p>
 
 <h2 id="qtcreator">Qt Creator</h2>
 
