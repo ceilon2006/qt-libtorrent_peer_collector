@@ -353,9 +353,101 @@ scripts/linux/deploy.sh --install # install to ~/.local/bin with a menu entry</c
 <pre><code>qmake6 libtorrent_peer_collector_qt.pro
 make</code></pre>
 
+<h2 id="maintenance-tool">Installing Qt with the Qt Online Installer or Maintenance Tool</h2>
+
+<p>Instead of the distribution packages, Qt can come from Qt's own installer. That gives a newer Qt and a matching Qt Creator, and it is the normal way on Windows. The first install is done with the <b>Qt Online Installer</b> from <code>qt.io/download-open-source</code>; every later change goes through the <b>Qt Maintenance Tool</b> it leaves behind. Both need a free Qt account.</p>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th></th><th>Linux</th><th>Windows</th></tr>
+</thead>
+<tbody>
+<tr><td>Maintenance Tool</td><td><code>~/Qt/MaintenanceTool</code></td><td><code>C:\Qt\MaintenanceTool.exe</code> (also in the Start menu)</td></tr>
+<tr><td>qmake after install</td><td><code>~/Qt/6.x.y/gcc_64/bin/qmake</code></td><td><code>C:\Qt\6.x.y\mingw_64\bin\qmake6.exe</code></td></tr>
+<tr><td>Compiler</td><td>the distribution's GCC</td><td><code>C:\Qt\Tools\mingw1310_64\bin</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>Components to select</h3>
+
+<p>Start the Maintenance Tool, choose <b>Add or remove components</b>, and tick these. The same tree appears in the Online Installer on a first install.</p>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>Tree entry</th><th>Linux</th><th>Windows</th><th>Why</th></tr>
+</thead>
+<tbody>
+<tr>
+  <td>Qt &rarr; Qt 6.x.y &rarr; <b>Desktop gcc 64-bit</b></td>
+  <td>required</td><td></td>
+  <td>The Qt libraries, headers, qmake and moc. Core, Gui, Widgets and Network are all inside this one entry.</td>
+</tr>
+<tr>
+  <td>Qt &rarr; Qt 6.x.y &rarr; <b>MinGW 64-bit</b></td>
+  <td></td><td>required</td>
+  <td>Same, built for MinGW. Pick this, not MSVC, so it matches the MinGW libtorrent.</td>
+</tr>
+<tr>
+  <td>Qt &rarr; Developer and Designer Tools &rarr; <b>MinGW 13.x 64-bit</b></td>
+  <td></td><td>required</td>
+  <td>The compiler and <code>mingw32-make</code>. Take the version the Qt build above was made with; the installer pre-selects it.</td>
+</tr>
+<tr>
+  <td>Qt &rarr; Developer and Designer Tools &rarr; <b>Qt Creator</b></td>
+  <td>optional</td><td>optional</td>
+  <td>IDE. Not needed for the scripts.</td>
+</tr>
+<tr>
+  <td>Qt &rarr; Qt 6.x.y &rarr; Additional Libraries &rarr; anything</td>
+  <td>no</td><td>no</td>
+  <td>Nothing under Additional Libraries is used. Widgets and Network are part of the base module.</td>
+</tr>
+<tr>
+  <td>Qt &rarr; Developer and Designer Tools &rarr; CMake, Ninja</td>
+  <td>no</td><td>no</td>
+  <td>The project builds with qmake only.</td>
+</tr>
+<tr>
+  <td>Qt &rarr; Qt 6.x.y &rarr; Sources, Qt Debug Information Files</td>
+  <td>no</td><td>no</td>
+  <td>Large, and not needed to build or debug this project.</td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<div class="note">
+<p>The installer never provides libtorrent, Boost, OpenSSL headers or pkg-config. On Linux those still come from the distribution: <code>sudo apt install build-essential libtorrent-rasterbar-dev</code>. On Windows see the section below.</p>
+</div>
+
+<h3>Pointing the build at the installer's Qt on Linux</h3>
+
+<p>The installer's qmake is called <code>qmake</code>, not <code>qmake6</code>, and it is not on <code>PATH</code>. Tell the build script where it is:</p>
+
+<pre><code>QMAKE=~/Qt/6.10.2/gcc_64/bin/qmake scripts/linux/build.sh</code></pre>
+
+<p>Or put the folder on <code>PATH</code> once per shell:</p>
+
+<pre><code>export PATH=~/Qt/6.10.2/gcc_64/bin:$PATH
+scripts/linux/build.sh</code></pre>
+
+<p>qmake records the Qt library folder in the executable's rpath, so the built program finds that Qt at run time without any environment variable. The binary is then tied to that <code>~/Qt</code> folder; to hand it to another machine, use the distribution packages instead.</p>
+
+<p>If both a distribution Qt and an installer Qt are present, <code>scripts/linux/build.sh</code> prints which one it used in its <code>qmake:</code> and <code>Qt version:</code> lines.</p>
+
+<h3>Which route to choose on Linux</h3>
+
+<ul>
+<li><b>Distribution packages</b> when you just want to build and run. One <code>apt install</code>, everything matches, and the binary runs on any machine with the same packages.</li>
+<li><b>Qt installer</b> when you need a newer Qt than the distribution ships, or want Qt Creator and Qt kept in step. libtorrent still comes from the distribution either way.</li>
+</ul>
+
 <h2 id="windows">Windows</h2>
 
-<p>The Qt side is the same as for any Qt Widgets program. The difference is libtorrent: the Qt Online Installer does not ship it, and the <code>.pro</code> file finds it through <code>pkg-config</code>, which the Qt installer does not ship either.</p>
+<p>The Qt side is the same as for any Qt Widgets program and can be installed with the Maintenance Tool as described above. The difference is libtorrent: the Qt Online Installer does not ship it, and the <code>.pro</code> file finds it through <code>pkg-config</code>, which the Qt installer does not ship either.</p>
 
 <h3>Recommended: everything from MSYS2</h3>
 
@@ -381,13 +473,7 @@ scripts\windows\deploy.bat</code></pre>
 
 <h3>Alternative: Qt Online Installer plus your own libtorrent</h3>
 
-<p>Install these components in the Qt Maintenance Tool:</p>
-<ul>
-<li>Qt 6.x &rarr; <b>MinGW 64-bit</b> (the prebuilt Qt libraries and qmake6)</li>
-<li>Qt 6.x &rarr; Additional Libraries: nothing extra; Widgets and Network are part of the base module</li>
-<li>Developer and Designer Tools &rarr; <b>MinGW 13.x 64-bit</b> (the compiler and mingw32-make)</li>
-<li>Developer and Designer Tools &rarr; <b>Qt Creator</b> (optional)</li>
-</ul>
+<p>Install Qt with the Maintenance Tool, ticking the Windows column of the component table above: <b>MinGW 64-bit</b> under Qt 6.x.y and <b>MinGW 13.x 64-bit</b> under Developer and Designer Tools. The scripts look for that layout by default (<code>C:\Qt\6.11.1\mingw_64</code> and <code>C:\Qt\Tools\mingw1310_64</code>); set <code>QMAKE</code>, <code>MAKE</code> or <code>MINGW_BIN</code> if yours differs.</p>
 
 <div class="warn">
 <p>libtorrent, Boost and OpenSSL must then come from somewhere else (vcpkg with the <code>x64-mingw-dynamic</code> triplet, or a source build) and must be compiled with a MinGW that is ABI-compatible with the one Qt ships. Mixing MSYS2's libtorrent with the Qt installer's Qt usually fails at link or start-up. That is why the all-MSYS2 route is recommended.</p>
