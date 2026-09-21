@@ -6,8 +6,18 @@ Guidance for AI agents and new contributors working in this repository.
 
 A single-executable Qt 6 Widgets desktop tool that opens a `.torrent` file in a
 real libtorrent-rasterbar session for a fixed run time, collects every IPv4
-peer endpoint it sees, and shows them in a sortable table (IP, port, sources,
-IPinfo country/city/provider/host). Nothing is written to disk on its own:
+peer endpoint it sees, and shows them in a sortable table (IP, port, "Have"
+= the share of the torrent a peer reported when last connected (`progress_ppm`
+from `peer_info`, empty for peers that never connected), sources, IPinfo
+country/city/provider/host). Right-click, Ctrl+C or the Copy Selected button
+copies the selected rows; the tab title and status line show total and
+"connected so far" counts. Two checkboxes beside the buttons
+(`export/sources`, `export/ipinfo`) decide what follows the endpoint on
+copied/saved lines; the IPinfo part is the table cells as shown ("RU, Moscow,
+AS8580 MTS PJSC, host"), not key=value. `options/ipinfo_lookup` decides
+whether lookups run at all. An application-wide `eventFilter` clears the
+table selection on any mouse press in the main window outside the table
+(except on Copy Selected); no cell tooltips, by request. Nothing is written to disk on its own:
 Copy Peers puts the table on the clipboard as text in its current sort order,
 Save Peers writes the same text to a file chosen in a dialog (last folder
 remembered in `paths/peers_dir`). "Extra trackers" (default: four public UDP
@@ -76,12 +86,16 @@ the binary) is gitignored. There are no tests, no CI, and no README.
 1. **Utility helpers** (`ipPortToText`, `sortedPeerList`, `buildPeerRows`,
    `parseIpInfoFields`, `pruneSelfPeers`, …). Pure functions over
    `std::set<QString>` peers and `std::map<QString, std::set<QString>>` peer
-   sources. The worker sends `PeerRows` (`QList<PeerRow>`, registered with
-   `qRegisterMetaType` in `main`) to the GUI; the GUI formats text lines as
+   sources. The worker sends `PeerRows` (`QList<PeerRow>` with endpoint,
+   sources, ipinfo, active; registered with `qRegisterMetaType` in `main`)
+   to the GUI; the GUI formats text lines as
    `IP:port<pad># source, source; ipinfo: …` with the `#` column aligned to
    longest endpoint + 5 (`peersAsText`).
-2. **Direct tracker announce.** `DirectAnnounceContext` holds one peer id and
-   key for the run plus the set of trackers that already got `started`.
+2. **Direct tracker announce.** `DirectAnnounceContext` holds the run's peer
+   id and key plus the set of trackers that already got `started`. The peer
+   id (`makePeerId`, libtorrent fingerprint prefix + random) is also given to
+   libtorrent as `settings_pack::peer_fingerprint` (20 bytes = whole id), so
+   the session and the direct announce are one client to trackers.
    HTTP/HTTPS: BEP 3 URL built by hand, blocking `QNetworkAccessManager` GET
    inside a local `QEventLoop` (15 s), compact `5:peers` parsed by a minimal
    bencode reader, not a general one. UDP: BEP 15 connect + announce on a
@@ -129,9 +143,25 @@ the binary) is gitignored. There are no tests, no CI, and no README.
   `ut_metadata`, `smart_ban` and, only when PEX is checked, `ut_pex` are
   attached through `add_torrent_params::extensions`. That is how the PEX
   checkbox works; there is no settings_pack key for it in 2.0.
-- Torrent data is saved to a `QTemporaryDir` with sparse storage. With
-  "no download" checked, all files and pieces are set to `dont_download`, but
-  the session still connects to peers (that is the point).
+- Torrent data is saved to a `QTemporaryDir` with sparse storage. "Minimal
+  download" keeps exactly one piece wanted (`low_priority`, rotating to the
+  next on `piece_finished_alert`) with `download_rate_limit` 1024 B/s. Marking
+  every piece `dont_download` makes the torrent finished and libtorrent then
+  opens no outgoing connections at all, so real peers are never contacted
+  (verified 2026-09-21: 0 established peers in 75 s vs seeds connecting in 4 s
+  with one piece wanted). `close_redundant_connections` is off so seeds are
+  not dropped before their bitfield is read. `get_peer_info` entries with the
+  `connecting`/`handshake` flags are tagged `connecting`, not counted as
+  connected; established peers get `activePeers` and the best `progress_ppm`
+  seen (seed flag = 1000000). In addition `ProgressTorrentPlugin` /
+  `ProgressPeerPlugin` (libtorrent peer plugin, attached via
+  `add_torrent_params::extensions`) record every handshake, bitfield,
+  have_all/have_none and have on libtorrent's network thread into a
+  mutex-guarded `PeerProgressBook`; the worker merges it each poll (tag
+  `connected/handshake`), so peers that leave within a poll interval still
+  get their share recorded. Shown in the "Have" column, green dot when a
+  connected peer never reported a figure, red cross and red IP for rows with
+  `peer-blocked`/`peer-banned` (libtorrent's own bans, sort key -2).
 - Poll loop: first iteration runs immediately, then sleeps `poll interval`
   (min 200 ms). Tracker and DHT forced reannounces have a hard floor of 30 s.
   The peers tab refreshes every 3 s and once more at the end; the worker never
