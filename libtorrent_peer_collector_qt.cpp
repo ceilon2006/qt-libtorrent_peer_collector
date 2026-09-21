@@ -1183,6 +1183,25 @@ protected:
 			pack.set_bool(lt::settings_pack::enable_lsd, enableLsd);
 			pack.set_bool(lt::settings_pack::enable_upnp, true);
 			pack.set_bool(lt::settings_pack::enable_natpmp, true);
+
+			/*
+			 * Alert mask.
+			 *
+			 * libtorrent 2.0 defaults alert_mask to error only. The alert
+			 * scraping below needs the peer category to see endpoints of peers
+			 * that connect/disconnect between polls or fail to connect at all.
+			 * tracker/dht/status are for the log; their messages carry counts
+			 * and URLs, not peer endpoints.
+			 */
+			pack.set_int(
+			    lt::settings_pack::alert_mask,
+			    static_cast<int>(
+			        lt::alert_category::error |
+			        lt::alert_category::peer |
+			        lt::alert_category::tracker |
+			        lt::alert_category::dht |
+			        lt::alert_category::status));
+
 			/*
 			 * PEX compatibility note:
 			 * Some libtorrent versions/builds do not expose settings_pack::enable_pex.
