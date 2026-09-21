@@ -6,7 +6,9 @@ Guidance for AI agents and new contributors working in this repository.
 
 A single-executable Qt 6 Widgets desktop tool that opens a `.torrent` file in a
 real libtorrent-rasterbar session for a fixed run time, collects every IPv4
-peer endpoint it sees, and writes them to a `peers.txt` file. It is a C++ port
+peer endpoint it sees, and shows them in a text tab. Nothing is written to
+disk on its own: Copy Peers puts the tab on the clipboard, Save Peers writes
+it to a file chosen in a dialog (last folder remembered in `paths/peers_dir`). It is a C++ port
 of an earlier Python script (`libtorrent_seen_peer_collector_v2_nodeprecated.py`,
 not in this repo).
 
@@ -68,7 +70,7 @@ the binary) is gitignored. There are no tests, no CI, and no README.
 ## Code map (by section in the .cpp)
 
 1. **Utility helpers** (`ipPortToText`, `sortedPeerList`, `buildPeerOutputLines`,
-   `savePeersToFile`, …). Pure functions over `std::set<QString>` peers and
+   `pruneSelfPeers`, …). Pure functions over `std::set<QString>` peers and
    `std::map<QString, std::set<QString>>` peer sources. Output lines are
    `IP:port<pad># source, source; ipinfo: …` with the `#` column aligned to
    longest endpoint + 5.
@@ -80,8 +82,15 @@ the binary) is gitignored. There are no tests, no CI, and no README.
    blocking `QUdpSocket`, two attempts of 5 s, IPv4 only, no connection id
    caching. `directAnnounceAllTrackers` dispatches by scheme and sends
    `started` once per tracker, then no event; `directStopAllTrackers` sends
-   `stopped` at the end with short timeouts. Verified against three public
-   UDP trackers with a throwaway torrent on 2026-09-21.
+   `stopped` at the end with short timeouts. All trackers of a round are
+   announced concurrently (`runTrackerJobsInParallel`, one `QThread` each),
+   and the poll loop runs the whole round on a further thread, merging
+   `roundPeers`/`roundSources`/`roundLogs` when it has finished, so a dead
+   tracker never stalls polling. `replied` means the tracker itself
+   answered (any HTTP status counts, DNS failure does not); only those get
+   `stopped`. Verified against public UDP trackers on 2026-09-21: eight
+   trackers in sequence took 16 s, in parallel 10 s (one dead UDP tracker),
+   `stopped` to five trackers 0.56 s.
 3. **IPinfo lookup.** `fetchIpInfoText` is the same blocking GET pattern,
    4 s timeout. Handles both legacy (`country`, `org`) and Lite
    (`country_code`, `asn{}` object) response shapes. `IpInfoLookupThread`
@@ -97,9 +106,12 @@ the binary) is gitignored. There are no tests, no CI, and no README.
    `peerCountChanged`, `peersPreviewChanged`, `progressChanged`,
    `finishedStatus`). Stop is cooperative via `std::atomic<bool>`.
 6. **`MainWindow : QMainWindow`.** Form of options, Start/Stop, Log and Peers
-   tabs, progress bar. Persists options with `QSettings("IRT",
-   "LibtorrentPeerCollectorCppQt")`. The IPinfo token is deliberately never
-   saved. Help button and F1 open a non-modal tabbed `QDialog` built by
+   tabs, progress bar. Settings identity is `CONFIG_FOLDER_NAME` /
+   `APP_NAME` (`myutils` / `LibtorrentPeerCollectorQt`), the same scheme as
+   `qt-p2p_filter_generator`; `main()` registers the same names on the
+   application so a bare `QSettings()` resolves to the same store. Keys are
+   grouped `paths/`, `options/`, `ui/` (window geometry, help geometry, last
+   tab). The IPinfo token is deliberately never saved. Help button and F1 open a non-modal tabbed `QDialog` built by
    `showHelpDialog` / `addHelpPage`, same pattern as the sibling
    `qt-p2p_filter_generator` and `qt-web_selector` projects. Keep the help
    text in step with the options and tags it describes.
@@ -116,20 +128,31 @@ the binary) is gitignored. There are no tests, no CI, and no README.
   the session still connects to peers (that is the point).
 - Poll loop: first iteration runs immediately, then sleeps `poll interval`
   (min 200 ms). Tracker and DHT forced reannounces have a hard floor of 30 s.
-  Output file is rewritten every 10 s and at the end. Preview tab refreshes
-  every 3 s.
+  The peers tab refreshes every 3 s and once more at the end; the worker never
+  touches the file system except for the temporary save path.
 - The direct announce presents itself as a leecher (`left=<total size>`) with
   a `-QTPC01-` peer id that is fixed for the run. Trackers therefore list this
   machine as a peer for the torrent while it runs, and drop it after
   `stopped`.
-- The worker's poll cycle can still block on the direct tracker announce,
-  up to 15 s per HTTP tracker and 2 × 5 s per UDP tracker (plus a blocking
-  DNS lookup). IPinfo no longer blocks it. "Stop" takes
-  effect between cycles; a normal end of run waits for the IPinfo queue to
-  drain, a user Stop abandons it and writes `ipinfo=pending`. `closeEvent`
-  waits at most 3 s.
+- Stop is honoured within about 200 ms wherever the worker is: the poll
+  sleep runs in 100 ms slices, the HTTP announce polls the cancel flag on a
+  200 ms timer inside its event loop, the UDP exchange waits in 200 ms
+  slices, and the tracker loop checks between trackers. The only
+  uninterruptible wait left is the blocking DNS lookup for a UDP tracker.
+  After Stop, `stopped` goes only to trackers that replied earlier (3 s /
+  2 s timeouts), the IPinfo queue is abandoned (`ipinfo=pending`), then the
+  final save. A normal end of run waits for the IPinfo queue to drain.
+  `closeEvent` waits at most 3 s for the thread.
 - IPv6 peers are dropped everywhere by design (`ipPortToText` returns empty for
   non-v4).
+- The machine's own addresses are pruned from the peer set every poll and
+  before the final save: all local IPv4 interface addresses plus whatever
+  `external_ip_alert` reports. Trackers echo the announcing peer back, and
+  without this the list contained the collector itself.
+- `peer-blocked` entries with no filter configured are libtorrent's own
+  session-level `ban_ip` of DHT snoopers (see `peer_connection.cpp`, the
+  `verify_secret_id` check): hosts that connect asking for a decoy info hash
+  libtorrent planted in DHT traffic. Not peers of the torrent.
 
 ## Known gaps and likely-bug areas
 
@@ -168,7 +191,7 @@ Check these before assuming the code does what its log messages claim.
   text and `docs/build-requirements.html` if packages are involved.
 - If you add a libtorrent setting, verify it exists in 2.0.x
   (`/usr/include/libtorrent/settings_pack.hpp`). Several 1.x names are gone.
-- If you touch the output format, keep `savePeersToFile` and the preview tab
-  in sync; both go through `buildPeerOutputLines`.
+- The peers tab text is the output. `buildPeerOutputLines` is the only
+  formatter; Copy and Save both take the tab verbatim.
 - There is no automated test harness. Verify by building and running against a
   well-seeded public torrent for a short run time.

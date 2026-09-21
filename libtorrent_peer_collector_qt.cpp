@@ -90,6 +90,7 @@
 #include <QtNetwork/QNetworkRequest>
 #include <QtNetwork/QHostAddress>
 #include <QtNetwork/QHostInfo>
+#include <QtNetwork/QNetworkInterface>
 #include <QtNetwork/QUdpSocket>
 
 #include <QtCore/QEventLoop>
@@ -127,6 +128,15 @@
 #include <vector>
 
 namespace lt = libtorrent;
+
+/*
+ * Identity for settings and per-user data. CONFIG_FOLDER_NAME is the
+ * organization: on Linux ~/.config/<CONFIG_FOLDER_NAME>/<APP_NAME>.conf, on
+ * Windows HKCU\Software\<CONFIG_FOLDER_NAME>\<APP_NAME>. Same names as
+ * the other tools in this family so they share one folder.
+ */
+#define CONFIG_FOLDER_NAME      "myutils"
+#define APP_NAME                "LibtorrentPeerCollectorQt"
 
 /* ------------------------------------------------------------------------- */
 /* Utility helpers                                                            */
@@ -395,6 +405,45 @@ static QStringList buildPeerOutputLines(const std::set<QString> &peers,
 }
 
 
+/*
+ * Addresses that are this machine. Trackers return the announcing peer in
+ * their reply, so without this the collector lists itself and libtorrent
+ * even tries to connect to it. Seeded with every local interface address;
+ * the worker adds the external address libtorrent reports.
+ */
+static std::set<QString> localInterfaceIpv4Addresses()
+{
+	std::set<QString> out;
+
+	for (const QHostAddress &a : QNetworkInterface::allAddresses()) {
+		if (a.protocol() == QAbstractSocket::IPv4Protocol) {
+			out.insert(a.toString());
+		}
+	}
+
+	return out;
+}
+
+/* Drop every peer whose IP is one of ours. Returns the removed endpoints. */
+static QStringList pruneSelfPeers(std::set<QString> &peers,
+                                  std::map<QString, std::set<QString>> &peer_sources,
+                                  const std::set<QString> &self_ips)
+{
+	QStringList removed;
+
+	for (auto it = peers.begin(); it != peers.end(); ) {
+		if (self_ips.find(peerIpOnly(*it)) != self_ips.end()) {
+			removed << *it;
+			peer_sources.erase(*it);
+			it = peers.erase(it);
+		} else {
+			++it;
+		}
+	}
+
+	return removed;
+}
+
 static int countPeersWithSource(const std::map<QString, std::set<QString>> &peer_sources,
                                 const QString &source)
 {
@@ -494,50 +543,6 @@ static QString buildPeerSummaryText(const std::set<QString> &peers,
 	    .arg(any_alert)
 	    .arg(unknown);
 }
-
-static bool savePeersToFile(const QString &path,
-                            const std::set<QString> &peers,
-                            const std::map<QString, std::set<QString>> &peer_sources,
-                            const std::map<QString, QString> &ip_info_cache,
-                            bool include_source_comments,
-                            bool include_ipinfo_comments,
-                            QString *error)
-{
-	QFileInfo info(path);
-	QDir dir = info.absoluteDir();
-
-	if (!dir.exists()) {
-		if (!dir.mkpath(".")) {
-			if (error != nullptr) {
-				*error = "Could not create directory: " + dir.absolutePath();
-			}
-			return false;
-		}
-	}
-
-	QFile f(path);
-	if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) {
-		if (error != nullptr) {
-			*error = f.errorString();
-		}
-		return false;
-	}
-
-	QTextStream out(&f);
-	QStringList list = buildPeerOutputLines(
-	    peers,
-	    peer_sources,
-	    ip_info_cache,
-	    include_source_comments,
-	    include_ipinfo_comments);
-
-	for (const QString &p : list) {
-		out << p << "\n";
-	}
-
-	return true;
-}
-
 
 /* ------------------------------------------------------------------------- */
 /* Direct HTTP/HTTPS tracker announce helpers                                 */
@@ -717,8 +722,14 @@ static QStringList parseTrackerResponsePeers(const QByteArray &data)
 struct DirectAnnounceContext {
 	QByteArray peer_id;
 	quint32 key = 0;
-	std::set<QString> started;    /* trackers that were sent event=started */
+	std::set<QString> started;    /* trackers that replied to event=started */
 };
+
+/* True when the user pressed Stop. Every wait below polls it. */
+static bool announceCancelled(const std::atomic<bool> *cancel)
+{
+	return cancel != nullptr && cancel->load();
+}
 
 /* BEP 3 event names as sent to HTTP trackers; BEP 15 numeric codes for UDP. */
 enum DirectAnnounceEvent {
@@ -781,46 +792,88 @@ static QByteArray buildTrackerAnnounceUrl(const QString &tracker_url,
 	return url;
 }
 
+/*
+ * One HTTP/HTTPS announce. *replied is set when the tracker answered at all,
+ * even with a failure reason: that is what decides whether it later needs
+ * event=stopped. The wait polls the cancel flag every 200 ms.
+ */
 static QStringList directHttpTrackerAnnounce(const QString &tracker_url,
                                              const lt::torrent_info &ti,
                                              int listen_port,
                                              const DirectAnnounceContext &ctx,
                                              DirectAnnounceEvent event,
                                              int timeout_ms,
+                                             const std::atomic<bool> *cancel,
+                                             bool *replied,
                                              QStringList *log_lines)
 {
 	QStringList peers;
 	QByteArray full_url = buildTrackerAnnounceUrl(tracker_url, ti, listen_port, ctx.peer_id, ctx.key, event);
+	bool cancelled = false;
+
+	if (replied != nullptr) {
+		*replied = false;
+	}
 
 	QNetworkAccessManager manager;
 	QNetworkRequest request(QUrl::fromEncoded(full_url));
+
+	/*
+	 * Some trackers (rutracker's bt*.t-ru.org among them) answer 403 to a
+	 * request without a client-looking User-Agent. This announce is made on
+	 * behalf of the libtorrent session in this process, so present it as
+	 * that libtorrent, the same string the session's own announces carry.
+	 */
+	request.setHeader(QNetworkRequest::UserAgentHeader,
+	                  QString("libtorrent/") + QString::fromLatin1(LIBTORRENT_VERSION));
+
 	QNetworkReply *reply = manager.get(request);
 
 	QEventLoop loop;
 	QTimer timeout;
+	QTimer cancel_poll;
 	timeout.setSingleShot(true);
 
 	QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
 	QObject::connect(&timeout, &QTimer::timeout, &loop, &QEventLoop::quit);
+	QObject::connect(&cancel_poll, &QTimer::timeout, &loop, [&]() {
+		if (announceCancelled(cancel)) {
+			cancelled = true;
+			loop.quit();
+		}
+	});
 
 	timeout.start(timeout_ms);
+	cancel_poll.start(200);
 	loop.exec();
+	cancel_poll.stop();
 
-	if (timeout.isActive()) {
+	if (cancelled || !timeout.isActive()) {
 		timeout.stop();
-	} else {
 		reply->abort();
 		reply->deleteLater();
-		if (log_lines != nullptr) {
+		if (log_lines != nullptr && !cancelled) {
 			*log_lines << "Direct tracker announce timeout: " + tracker_url;
 		}
 		return peers;
 	}
 
+	timeout.stop();
+
 	QByteArray data = reply->readAll();
 	QNetworkReply::NetworkError net_error = reply->error();
 	QString error_string = reply->errorString();
+	bool got_http_status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).isValid();
 	reply->deleteLater();
+
+	/*
+	 * "Replied" means the tracker itself answered, even with an HTTP error
+	 * such as 403. A DNS failure or a refused connection is not a reply, so
+	 * the tracker is retried with "started" next time and gets no "stopped".
+	 */
+	if (replied != nullptr) {
+		*replied = (net_error == QNetworkReply::NoError) || got_http_status;
+	}
 
 	if (net_error != QNetworkReply::NoError) {
 		if (log_lines != nullptr) {
@@ -871,10 +924,16 @@ static QByteArray udpTrackerExchange(QUdpSocket &sock,
                                      quint16 port,
                                      const QByteArray &request,
                                      quint32 transaction_id,
-                                     int timeout_ms)
+                                     int timeout_ms,
+                                     int attempts,
+                                     const std::atomic<bool> *cancel)
 {
-	for (int attempt = 0; attempt < 2; attempt++) {
+	for (int attempt = 0; attempt < attempts; attempt++) {
 		QElapsedTimer t;
+
+		if (announceCancelled(cancel)) {
+			return QByteArray();
+		}
 
 		if (sock.writeDatagram(request, addr, port) != request.size()) {
 			return QByteArray();
@@ -885,8 +944,17 @@ static QByteArray udpTrackerExchange(QUdpSocket &sock,
 		while (t.elapsed() < timeout_ms) {
 			int remaining = timeout_ms - (int)t.elapsed();
 
+			if (announceCancelled(cancel)) {
+				return QByteArray();
+			}
+
+			/* Wait in short slices so a Stop is noticed within 200 ms. */
+			if (remaining > 200) {
+				remaining = 200;
+			}
+
 			if (!sock.waitForReadyRead(remaining)) {
-				break;
+				continue;
 			}
 
 			while (sock.hasPendingDatagrams()) {
@@ -911,9 +979,16 @@ static QStringList directUdpTrackerAnnounce(const QString &tracker_url,
                                             const DirectAnnounceContext &ctx,
                                             DirectAnnounceEvent event,
                                             int timeout_ms,
+                                            int attempts,
+                                            const std::atomic<bool> *cancel,
+                                            bool *replied,
                                             QStringList *log_lines)
 {
 	QStringList peers;
+
+	if (replied != nullptr) {
+		*replied = false;
+	}
 	QUrl parsed(tracker_url);
 	QString host = parsed.host();
 	int port = parsed.port(-1);
@@ -964,10 +1039,10 @@ static QStringList directUdpTrackerAnnounce(const QString &tracker_url,
 		ds << (quint64)0x41727101980ULL << (quint32)0 << tid;
 	}
 
-	reply = udpTrackerExchange(sock, addr, (quint16)port, request, tid, timeout_ms);
+	reply = udpTrackerExchange(sock, addr, (quint16)port, request, tid, timeout_ms, attempts, cancel);
 
 	if (reply.size() < 16 || readBigEndian32(reply, 0) != 0) {
-		if (log_lines != nullptr) {
+		if (log_lines != nullptr && !announceCancelled(cancel)) {
 			*log_lines << "Direct UDP announce: no connect reply from " + tracker_url;
 		}
 		return peers;
@@ -998,13 +1073,17 @@ static QStringList directUdpTrackerAnnounce(const QString &tracker_url,
 		   << (quint16)listen_port;
 	}
 
-	reply = udpTrackerExchange(sock, addr, (quint16)port, request, tid, timeout_ms);
+	reply = udpTrackerExchange(sock, addr, (quint16)port, request, tid, timeout_ms, attempts, cancel);
 
 	if (reply.size() < 8) {
-		if (log_lines != nullptr) {
+		if (log_lines != nullptr && !announceCancelled(cancel)) {
 			*log_lines << "Direct UDP announce timeout: " + tracker_url;
 		}
 		return peers;
+	}
+
+	if (replied != nullptr) {
+		*replied = true;
 	}
 
 	action = readBigEndian32(reply, 0);
@@ -1041,6 +1120,58 @@ static QStringList directUdpTrackerAnnounce(const QString &tracker_url,
 /* ------------------------------------------------------------------------- */
 
 /*
+ * One tracker's announce, run on its own thread. Each thread owns its
+ * QNetworkAccessManager or QUdpSocket, created inside the announce function,
+ * so nothing is shared except the read-only context and the cancel flag.
+ */
+struct TrackerAnnounceJob {
+	QString tracker_url;
+	QString scheme;
+	DirectAnnounceEvent event = ANNOUNCE_EVENT_NONE;
+	QStringList found;
+	QStringList logs;
+	bool replied = false;
+};
+
+/*
+ * Run every job concurrently and wait for all of them. Trackers are
+ * independent, and one dead hostname must not hold up the others: run in
+ * sequence, eight trackers took 16 s; in parallel they take as long as the
+ * slowest one. Stop is still honoured inside each job through cancel.
+ */
+static void runTrackerJobsInParallel(std::vector<TrackerAnnounceJob> &jobs,
+                                     const lt::torrent_info &ti,
+                                     int listen_port,
+                                     const DirectAnnounceContext &ctx,
+                                     int http_timeout_ms,
+                                     int udp_timeout_ms,
+                                     int udp_attempts,
+                                     const std::atomic<bool> *cancel)
+{
+	std::vector<QThread *> threads;
+
+	for (TrackerAnnounceJob &job : jobs) {
+		QThread *t = QThread::create([&job, &ti, listen_port, &ctx, http_timeout_ms, udp_timeout_ms, udp_attempts, cancel]() {
+			if (job.scheme == "http" || job.scheme == "https") {
+				job.found = directHttpTrackerAnnounce(job.tracker_url, ti, listen_port, ctx, job.event,
+				                                     http_timeout_ms, cancel, &job.replied, &job.logs);
+			} else if (job.scheme == "udp") {
+				job.found = directUdpTrackerAnnounce(job.tracker_url, ti, listen_port, ctx, job.event,
+				                                    udp_timeout_ms, udp_attempts, cancel, &job.replied, &job.logs);
+			}
+		});
+
+		threads.push_back(t);
+		t->start();
+	}
+
+	for (QThread *t : threads) {
+		t->wait();
+		delete t;
+	}
+}
+
+/*
  * Announce to every tracker in the torrent that speaks HTTP, HTTPS or UDP.
  * The first announce to a tracker sends event=started; later ones send no
  * event. Returns how many peers were new to the set.
@@ -1050,47 +1181,63 @@ static int directAnnounceAllTrackers(const std::shared_ptr<lt::torrent_info> &ti
                                      DirectAnnounceContext &ctx,
                                      std::set<QString> &peers,
                                      std::map<QString, std::set<QString>> &peer_sources,
+                                     const std::atomic<bool> *cancel,
                                      QStringList *log_lines)
 {
+	std::vector<TrackerAnnounceJob> jobs;
+	QElapsedTimer timer;
 	int added = 0;
 
 	if (!ti) {
 		return 0;
 	}
 
-	std::vector<lt::announce_entry> trackers = ti->trackers();
+	timer.start();
 
-	for (const lt::announce_entry &ae : trackers) {
-		QString tracker_url = QString::fromStdString(ae.url);
-		QString scheme = QUrl(tracker_url).scheme().toLower();
-		DirectAnnounceEvent event;
-		QStringList found;
-		const char *tag;
+	for (const lt::announce_entry &ae : ti->trackers()) {
+		TrackerAnnounceJob job;
 
-		event = (ctx.started.find(tracker_url) == ctx.started.end())
-		            ? ANNOUNCE_EVENT_STARTED
-		            : ANNOUNCE_EVENT_NONE;
+		job.tracker_url = QString::fromStdString(ae.url);
+		job.scheme = QUrl(job.tracker_url).scheme().toLower();
 
-		if (scheme == "http" || scheme == "https") {
-			found = directHttpTrackerAnnounce(tracker_url, *ti, listen_port, ctx, event, 15000, log_lines);
-			tag = "tracker-direct-http";
-		} else if (scheme == "udp") {
-			found = directUdpTrackerAnnounce(tracker_url, *ti, listen_port, ctx, event, 5000, log_lines);
-			tag = "tracker-direct-udp";
-		} else {
+		if (job.scheme != "http" && job.scheme != "https" && job.scheme != "udp") {
 			if (log_lines != nullptr) {
-				*log_lines << "Direct tracker announce skipped unsupported scheme: " + tracker_url;
+				*log_lines << "Direct tracker announce skipped unsupported scheme: " + job.tracker_url;
 			}
 			continue;
 		}
 
-		/*
-		 * Whether or not peers came back, the tracker has now heard "started"
-		 * from this peer id, so the next announce must not repeat it.
-		 */
-		ctx.started.insert(tracker_url);
+		job.event = (ctx.started.find(job.tracker_url) == ctx.started.end())
+		                ? ANNOUNCE_EVENT_STARTED
+		                : ANNOUNCE_EVENT_NONE;
 
-		for (const QString &p : found) {
+		jobs.push_back(job);
+	}
+
+	if (jobs.empty() || announceCancelled(cancel)) {
+		return 0;
+	}
+
+	runTrackerJobsInParallel(jobs, *ti, listen_port, ctx, 15000, 5000, 2, cancel);
+
+	for (const TrackerAnnounceJob &job : jobs) {
+		const char *tag = (job.scheme == "udp") ? "tracker-direct-udp" : "tracker-direct-http";
+
+		if (log_lines != nullptr) {
+			*log_lines << job.logs;
+		}
+
+		/*
+		 * Only a tracker that answered has heard "started" from this peer id.
+		 * It must not get it again, and it is the only kind worth a "stopped"
+		 * at the end. A tracker that timed out is retried with "started" next
+		 * interval and never gets a pointless "stopped".
+		 */
+		if (job.replied) {
+			ctx.started.insert(job.tracker_url);
+		}
+
+		for (const QString &p : job.found) {
 			if (peers.insert(p).second) {
 				added++;
 			}
@@ -1099,35 +1246,57 @@ static int directAnnounceAllTrackers(const std::shared_ptr<lt::torrent_info> &ti
 		}
 	}
 
+	if (log_lines != nullptr && !announceCancelled(cancel)) {
+		*log_lines << QString("Direct announces to %1 tracker(s) took %2 ms.")
+		                  .arg(jobs.size())
+		                  .arg(timer.elapsed());
+	}
+
 	return added;
 }
 
 /*
- * Tell every tracker that got a "started" that this peer is gone. Best
- * effort with short timeouts: the run is ending and nothing depends on the
- * replies.
+ * Tell every tracker that answered a "started" that this peer is gone. All
+ * at once, single attempt, short timeouts: the run is ending and nothing
+ * depends on the replies.
  */
 static void directStopAllTrackers(const std::shared_ptr<lt::torrent_info> &ti,
                                   int listen_port,
                                   const DirectAnnounceContext &ctx,
                                   QStringList *log_lines)
 {
+	std::vector<TrackerAnnounceJob> jobs;
+	QElapsedTimer timer;
+	int sent = 0;
+
 	if (!ti || ctx.started.empty()) {
 		return;
 	}
 
-	for (const QString &tracker_url : ctx.started) {
-		QString scheme = QUrl(tracker_url).scheme().toLower();
+	timer.start();
 
-		if (scheme == "http" || scheme == "https") {
-			directHttpTrackerAnnounce(tracker_url, *ti, listen_port, ctx, ANNOUNCE_EVENT_STOPPED, 5000, log_lines);
-		} else if (scheme == "udp") {
-			directUdpTrackerAnnounce(tracker_url, *ti, listen_port, ctx, ANNOUNCE_EVENT_STOPPED, 3000, log_lines);
+	for (const QString &tracker_url : ctx.started) {
+		TrackerAnnounceJob job;
+
+		job.tracker_url = tracker_url;
+		job.scheme = QUrl(tracker_url).scheme().toLower();
+		job.event = ANNOUNCE_EVENT_STOPPED;
+		jobs.push_back(job);
+	}
+
+	runTrackerJobsInParallel(jobs, *ti, listen_port, ctx, 2000, 1000, 1, nullptr);
+
+	for (const TrackerAnnounceJob &job : jobs) {
+		if (job.replied) {
+			sent++;
 		}
 	}
 
 	if (log_lines != nullptr) {
-		*log_lines << QString("Sent event=stopped to %1 tracker(s).").arg(ctx.started.size());
+		*log_lines << QString("Sent event=stopped to %1 of %2 tracker(s) in %3 ms.")
+		                  .arg(sent)
+		                  .arg(jobs.size())
+		                  .arg(timer.elapsed());
 	}
 }
 
@@ -1551,6 +1720,30 @@ static bool shouldLogAlert(lt::alert *a)
 {
 	lt::alert_category_t cat = a->category();
 
+	/*
+	 * DHT traffic alerts arrive several times a second once the table is
+	 * warm and say nothing about this torrent's peers: get_peers queries
+	 * from and to other nodes, and announces for other info hashes. Replies
+	 * with peers, bootstrap and errors still go through.
+	 */
+	if (lt::alert_cast<lt::dht_get_peers_alert>(a) != nullptr ||
+	    lt::alert_cast<lt::dht_outgoing_get_peers_alert>(a) != nullptr ||
+	    lt::alert_cast<lt::dht_announce_alert>(a) != nullptr) {
+		return false;
+	}
+
+	/*
+	 * libtorrent announces once per listen socket, including the loopback
+	 * one, which can never reach a tracker. Its "sending announce" and
+	 * "skipping tracker announce (unreachable)" lines say nothing useful.
+	 * alert_cast is exact-type only, so the base class needs dynamic_cast.
+	 */
+	if (auto *ta = dynamic_cast<lt::tracker_alert *>(a)) {
+		if (ta->local_endpoint.address().is_loopback()) {
+			return false;
+		}
+	}
+
 	if (cat & (lt::alert_category::error |
 	           lt::alert_category::tracker |
 	           lt::alert_category::dht |
@@ -1576,7 +1769,6 @@ class PeerCollectorThread : public QThread {
 
 public:
 	PeerCollectorThread(const QString &torrent_path,
-	                    const QString &output_path,
 	                    int run_time_seconds,
 	                    double peer_poll_interval_seconds,
 	                    double tracker_reannounce_interval_seconds,
@@ -1593,7 +1785,6 @@ public:
 	                    QObject *parent = nullptr)
 	    : QThread(parent),
 	      torrentPath(torrent_path),
-	      outputPath(output_path),
 	      runTimeSeconds(run_time_seconds),
 	      pollIntervalMs((int)(peer_poll_interval_seconds * 1000.0)),
 	      trackerReannounceMs((int)(tracker_reannounce_interval_seconds * 1000.0)),
@@ -1644,7 +1835,6 @@ protected:
 		std::set<QString> peers;
 		std::map<QString, std::set<QString>> peerSources;
 		std::map<QString, QString> ipInfoCache;
-		QString save_error;
 
 		try {
 			if (!QFileInfo::exists(torrentPath)) {
@@ -1659,7 +1849,6 @@ protected:
 			}
 
 			emit logMessage("Torrent     : " + torrentPath);
-			emit logMessage("Output      : " + outputPath);
 			emit logMessage("Save path   : " + tempDir.path());
 			emit logMessage("Run time    : " + QString::number(runTimeSeconds) + " seconds");
 			emit logMessage("Peer poll   : " + QString::number(pollIntervalMs / 1000.0, 'f', 1) + " seconds");
@@ -1709,6 +1898,14 @@ protected:
 			pack.set_str(
 			    lt::settings_pack::listen_interfaces,
 			    QString("0.0.0.0:%1").arg(listenPort).toStdString());
+
+			/*
+			 * On shutdown libtorrent waits for its own event=stopped announces,
+			 * 5 s by default. That is what the window close and a quick
+			 * restart on the same port wait for; 2 s is plenty for live
+			 * trackers and dead ones are not worth waiting for.
+			 */
+			pack.set_int(lt::settings_pack::stop_tracker_timeout, 2);
 
 			pack.set_str(
 			    lt::settings_pack::dht_bootstrap_nodes,
@@ -1801,7 +1998,7 @@ protected:
 
 			emit logMessage("Waiting for peers...");
 			emit logMessage("Peer list includes connected peers, IPv4:port endpoints found in libtorrent alerts,");
-			emit logMessage("and direct compact IPv4 peers returned by HTTP/HTTPS trackers.");
+			emit logMessage("and direct compact IPv4 peers returned by HTTP, HTTPS and UDP trackers.");
 			emit logMessage("Output comments auto-align: # column = longest IP:port length + 5 spaces.");
 			if (includeIpInfoComments) {
 				emit logMessage("IPinfo lookups run in the background and are cached. Same IP is looked up only once.");
@@ -1813,6 +2010,75 @@ protected:
 			announceCtx.peer_id = makePeerId();
 			announceCtx.key = QRandomGenerator::global()->generate();
 
+			std::set<QString> selfIps = localInterfaceIpv4Addresses();
+			std::set<QString> selfExcludedLogged;
+
+			/*
+			 * The direct announce round runs on its own thread so a slow or
+			 * dead tracker never stalls polling. The round writes only into
+			 * these round-local containers and announceCtx; the poll loop
+			 * merges them once the thread has finished. announceCancel is
+			 * set by Stop and by the natural end of the run.
+			 */
+			std::unique_ptr<QThread> announceRound;
+			std::set<QString> roundPeers;
+			std::map<QString, std::set<QString>> roundSources;
+			QStringList roundLogs;
+			std::atomic<bool> announceCancel(false);
+
+			/*
+			 * Whatever way run() leaves this scope, a round still in flight
+			 * is cancelled and joined before the containers it writes to are
+			 * destroyed. Declared after them so it is destroyed first.
+			 */
+			struct AnnounceRoundGuard {
+				std::unique_ptr<QThread> &thread;
+				std::atomic<bool> &cancel;
+
+				~AnnounceRoundGuard()
+				{
+					if (thread) {
+						cancel.store(true);
+						thread->wait();
+					}
+				}
+			} announceRoundGuard{announceRound, announceCancel};
+
+			auto finishAnnounceRound = [&](bool wait_for_it) {
+				int added = 0;
+
+				if (!announceRound) {
+					return;
+				}
+
+				if (wait_for_it) {
+					announceRound->wait();
+				} else if (!announceRound->isFinished()) {
+					return;
+				}
+
+				announceRound->wait();
+				announceRound.reset();
+
+				for (const QString &line : roundLogs) {
+					emit logMessage(line);
+				}
+
+				for (const QString &p : roundPeers) {
+					if (peers.insert(p).second) {
+						added++;
+					}
+				}
+
+				for (const auto &item : roundSources) {
+					peerSources[item.first].insert(item.second.begin(), item.second.end());
+				}
+
+				if (added > 0) {
+					emit logMessage("Direct tracker announce added peers: " + QString::number(added));
+				}
+			};
+
 			std::unique_ptr<IpInfoLookupThread> ipInfoLookup;
 
 			if (includeIpInfoComments) {
@@ -1823,7 +2089,6 @@ protected:
 			QElapsedTimer timer;
 			timer.start();
 
-			qint64 last_save_ms = -100000;
 			qint64 last_preview_ms = -100000;
 			qint64 last_tracker_reannounce_ms = 0;
 			qint64 last_dht_reannounce_ms = 0;
@@ -1844,7 +2109,16 @@ protected:
 				 * After that, tracker/DHT announces and peer polling obey their intervals.
 				 */
 				if (!first_poll) {
-					msleep((unsigned long)pollIntervalMs);
+					/* Sleep in slices so Stop is noticed within 100 ms. */
+					QElapsedTimer sleep_timer;
+
+					sleep_timer.start();
+
+					while (!stopRequested.load() && sleep_timer.elapsed() < pollIntervalMs) {
+						qint64 left_ms = pollIntervalMs - sleep_timer.elapsed();
+
+						msleep((unsigned long)(left_ms < 100 ? left_ms : 100));
+					}
 				}
 
 				elapsed = (int)(timer.elapsed() / 1000);
@@ -1858,7 +2132,10 @@ protected:
 					emit logMessage("Immediate first peer poll...");
 				}
 
-				if (enableTrackers &&
+				/* Merge a finished announce round, if any, without waiting. */
+				finishAnnounceRound(false);
+
+				if (enableTrackers && !announceRound &&
 				    (first_poll || timer.elapsed() - last_tracker_reannounce_ms >= trackerReannounceMs)) {
 					try {
 						h.force_reannounce();
@@ -1866,22 +2143,21 @@ protected:
 					} catch (...) {
 					}
 
-					QStringList direct_logs;
-					int added_direct = directAnnounceAllTrackers(
-					    ti,
-					    listenPort,
-					    announceCtx,
-					    peers,
-					    peerSources,
-					    &direct_logs);
+					roundPeers.clear();
+					roundSources.clear();
+					roundLogs.clear();
 
-					for (const QString &line : direct_logs) {
-						emit logMessage(line);
-					}
-
-					if (added_direct > 0) {
-						emit logMessage("Direct tracker announce added peers: " + QString::number(added_direct));
-					}
+					announceRound.reset(QThread::create([&]() {
+						directAnnounceAllTrackers(
+						    ti,
+						    listenPort,
+						    announceCtx,
+						    roundPeers,
+						    roundSources,
+						    &announceCancel,
+						    &roundLogs);
+					}));
+					announceRound->start();
 
 					last_tracker_reannounce_ms = timer.elapsed();
 				}
@@ -1904,6 +2180,12 @@ protected:
 					for (lt::alert *a : alerts) {
 						QString endpoint;
 						QString source;
+
+						if (auto *ext = lt::alert_cast<lt::external_ip_alert>(a)) {
+							if (ext->external_address.is_v4()) {
+								selfIps.insert(QString::fromStdString(ext->external_address.to_string()));
+							}
+						}
 
 						if (classifyPeerAlert(a, &endpoint, &source)) {
 							/*
@@ -1952,6 +2234,12 @@ protected:
 				} catch (...) {
 				}
 
+				for (const QString &p : pruneSelfPeers(peers, peerSources, selfIps)) {
+					if (selfExcludedLogged.insert(p).second) {
+						emit logMessage("Excluded own address from peer list: " + p);
+					}
+				}
+
 				if ((int)peers.size() != last_count || first_poll) {
 					last_count = (int)peers.size();
 					emit logMessage("Seen/known peers: " + QString::number(last_count));
@@ -1968,13 +2256,6 @@ protected:
 					ipInfoCache = ipInfoLookup->snapshot();
 				}
 
-				if (first_poll || timer.elapsed() - last_save_ms >= 10000) {
-					if (!savePeersToFile(outputPath, peers, peerSources, ipInfoCache, includeSourceComments, includeIpInfoComments, &save_error)) {
-						emit logMessage("Save error: " + save_error);
-					}
-					last_save_ms = timer.elapsed();
-				}
-
 				if (first_poll || timer.elapsed() - last_preview_ms >= 3000) {
 					emit peersPreviewChanged(buildPeerOutputLines(peers, peerSources, ipInfoCache, includeSourceComments, includeIpInfoComments).join("\n") + (peers.empty() ? "" : "\n"));
 					last_preview_ms = timer.elapsed();
@@ -1983,9 +2264,17 @@ protected:
 				first_poll = false;
 			}
 
+			QElapsedTimer shutdown_timer;
+
+			shutdown_timer.start();
+
 			if (stopRequested.load()) {
 				emit logMessage("Stop requested by user.");
 			}
+
+			/* A round still in flight ends within 200 ms once cancelled. */
+			announceCancel.store(true);
+			finishAnnounceRound(true);
 
 			if (enableTrackers) {
 				QStringList stop_logs;
@@ -2035,37 +2324,35 @@ protected:
 				ipInfoCache = ipInfoLookup->snapshot();
 			}
 
-			if (!savePeersToFile(outputPath, peers, peerSources, ipInfoCache, includeSourceComments, includeIpInfoComments, &save_error)) {
-				emit finishedStatus(false, "Final save error: " + save_error);
-				return;
-			}
+			pruneSelfPeers(peers, peerSources, selfIps);
 
 			emit peersPreviewChanged(buildPeerOutputLines(peers, peerSources, ipInfoCache, includeSourceComments, includeIpInfoComments).join("\n") + (peers.empty() ? "" : "\n"));
 			emit progressChanged(runTimeSeconds, runTimeSeconds);
 
 			emit logMessage("");
 			emit logMessage(buildPeerSummaryText(peers, peerSources));
-			emit logMessage("Done. Unique seen/known peers saved: " + QString::number(peers.size()));
-			emit logMessage("Saved to: " + outputPath);
+			emit logMessage("Done. Unique seen/known peers: " + QString::number(peers.size()));
+			emit logMessage("Wrap-up after the poll loop took " + QString::number(shutdown_timer.elapsed()) + " ms.");
+			emit logMessage("Copy Peers puts the list on the clipboard, Save Peers... writes it to a file.");
 			emit logMessage("");
 			emit logMessage("Note:");
 			emit logMessage("  PEX peers are only discovered after connecting to peers.");
 			emit logMessage("  Running longer usually finds more peers.");
 
-			emit finishedStatus(true, "Done. Unique seen/known peers saved: " + QString::number(peers.size()));
+			emit finishedStatus(true, "Done. Unique seen/known peers: " + QString::number(peers.size()));
 
 		} catch (const std::exception &e) {
-			savePeersToFile(outputPath, peers, peerSources, ipInfoCache, includeSourceComments, includeIpInfoComments, nullptr);
+			/* Whatever was collected stays visible in the peers tab. */
+			emit peersPreviewChanged(buildPeerOutputLines(peers, peerSources, ipInfoCache, includeSourceComments, includeIpInfoComments).join("\n") + (peers.empty() ? "" : "\n"));
 			emit finishedStatus(false, "Exception: " + QString::fromUtf8(e.what()));
 		} catch (...) {
-			savePeersToFile(outputPath, peers, peerSources, ipInfoCache, includeSourceComments, includeIpInfoComments, nullptr);
+			emit peersPreviewChanged(buildPeerOutputLines(peers, peerSources, ipInfoCache, includeSourceComments, includeIpInfoComments).join("\n") + (peers.empty() ? "" : "\n"));
 			emit finishedStatus(false, "Unknown exception.");
 		}
 	}
 
 private:
 	QString torrentPath;
-	QString outputPath;
 	int runTimeSeconds;
 	int pollIntervalMs;
 	int trackerReannounceMs;
@@ -2092,7 +2379,7 @@ class MainWindow : public QMainWindow {
 public:
 	MainWindow(QWidget *parent = nullptr)
 	    : QMainWindow(parent),
-	      settings("IRT", "LibtorrentPeerCollectorCppQt"),
+	      settings(CONFIG_FOLDER_NAME, APP_NAME),
 	      worker(nullptr)
 	{
 		QWidget *root;
@@ -2175,7 +2462,7 @@ private:
 	QSettings settings;
 
 	QLineEdit *torrentPathEdit = nullptr;
-	QLineEdit *outputPathEdit = nullptr;
+	QString lastPeersDir;    /* folder of the last Save Peers */
 	QSpinBox *runTimeSpin = nullptr;
 	QDoubleSpinBox *pollSpin = nullptr;
 	QDoubleSpinBox *trackerReannounceSpin = nullptr;
@@ -2213,29 +2500,20 @@ private:
 		QGroupBox *group;
 		QGridLayout *grid;
 		QPushButton *browse_torrent;
-		QPushButton *browse_output;
 
-		group = new QGroupBox("Files", this);
+		group = new QGroupBox("Torrent", this);
 		grid = new QGridLayout(group);
 
 		torrentPathEdit = new QLineEdit(group);
-		outputPathEdit = new QLineEdit(group);
-
 		browse_torrent = new QPushButton("Browse .torrent...", group);
-		browse_output = new QPushButton("Choose output peers.txt...", group);
 
 		grid->addWidget(new QLabel("Torrent file:", group), 0, 0);
 		grid->addWidget(torrentPathEdit, 0, 1);
 		grid->addWidget(browse_torrent, 0, 2);
 
-		grid->addWidget(new QLabel("Output peers.txt:", group), 1, 0);
-		grid->addWidget(outputPathEdit, 1, 1);
-		grid->addWidget(browse_output, 1, 2);
-
 		parent->addWidget(group);
 
 		connect(browse_torrent, &QPushButton::clicked, this, &MainWindow::browseTorrent);
-		connect(browse_output, &QPushButton::clicked, this, &MainWindow::browseOutput);
 	}
 
 	void createOptionsGroup(QVBoxLayout *parent)
@@ -2328,7 +2606,7 @@ private:
 	{
 		QHBoxLayout *row;
 		QPushButton *copy_peers;
-		QPushButton *open_output;
+		QPushButton *save_peers;
 		QPushButton *clear_log;
 
 		row = new QHBoxLayout();
@@ -2336,7 +2614,7 @@ private:
 		startButton = new QPushButton("Start Collection", this);
 		stopButton = new QPushButton("Stop", this);
 		copy_peers = new QPushButton("Copy Peers", this);
-		open_output = new QPushButton("Open Output File", this);
+		save_peers = new QPushButton("Save Peers...", this);
 		clear_log = new QPushButton("Clear Log", this);
 		helpButton = new QPushButton("Help", this);
 
@@ -2346,7 +2624,7 @@ private:
 		row->addWidget(startButton);
 		row->addWidget(stopButton);
 		row->addWidget(copy_peers);
-		row->addWidget(open_output);
+		row->addWidget(save_peers);
 		row->addWidget(clear_log);
 		row->addWidget(helpButton);
 		row->addStretch(1);
@@ -2356,7 +2634,7 @@ private:
 		connect(startButton, &QPushButton::clicked, this, &MainWindow::startCollection);
 		connect(stopButton, &QPushButton::clicked, this, &MainWindow::stopCollection);
 		connect(copy_peers, &QPushButton::clicked, this, &MainWindow::copyPeers);
-		connect(open_output, &QPushButton::clicked, this, &MainWindow::openOutputFile);
+		connect(save_peers, &QPushButton::clicked, this, &MainWindow::savePeers);
 		connect(clear_log, &QPushButton::clicked, this, [this]() {
 			if (logText != nullptr) {
 				logText->clear();
@@ -2433,23 +2711,29 @@ private:
 		    "sees: peers returned by trackers, found through DHT, exchanged over "
 		    "PEX, discovered on the local network, and every peer libtorrent "
 		    "tries to connect to, whether the connection succeeds or not.</p>"
-		    "<p>The result is a plain text file, one <tt>IP:port</tt> per line, "
-		    "with an optional comment saying where each peer was seen.</p>"
+		    "<p>The result is a plain text list in the Seen / Known Peers tab, one "
+		    "<tt>IP:port</tt> per line, with an optional comment saying where "
+		    "each peer was seen. Nothing is written to disk on its own: "
+		    "<b>Copy Peers</b> puts the list on the clipboard and "
+		    "<b>Save Peers...</b> writes it to a file you pick.</p>"
 		    "<h3>The usual flow</h3>"
 		    "<ol>"
-		    "<li>Choose a <b>Torrent file</b> and an <b>Output peers.txt</b> path.</li>"
+		    "<li>Choose a <b>Torrent file</b>.</li>"
 		    "<li>Set the <b>Run time</b>. Longer runs find more peers.</li>"
 		    "<li>Press <b>Start Collection</b>.</li>"
 		    "<li>Watch the <b>Log</b> tab for tracker and DHT activity and the "
 		    "<b>Seen / Known Peers</b> tab for the growing list.</li>"
-		    "<li>The output file is rewritten every 10 seconds and once more at "
-		    "the end, so stopping early still leaves a complete file.</li>"
+		    "<li>When it is done, or after Stop, press <b>Copy Peers</b> or "
+		    "<b>Save Peers...</b>. The list in the tab is complete at that "
+		    "point; it refreshes every 3 seconds while running.</li>"
 		    "</ol>"
 		    "<h3>While it runs</h3>"
-		    "<p><b>Stop</b> asks the collector to finish its current poll cycle "
-		    "and then save. A cycle can take a while when an HTTP tracker is slow "
-		    "to answer, so Stop is not always instant. Pending IPinfo lookups are "
-		    "abandoned on Stop and the affected lines say "
+		    "<p><b>Stop</b> interrupts whatever the collector is doing within a "
+		    "fraction of a second: the poll sleep, a tracker announce in flight, "
+		    "and the IPinfo queue. It then tells the trackers that answered "
+		    "earlier that this peer is leaving, with short timeouts, and puts the "
+		    "final list in the peers tab. "
+		    "Pending IPinfo lookups are abandoned and the affected lines say "
 		    "<tt>ipinfo=pending</tt>.</p>"
 		    "<p>Torrent data is written to a temporary directory that is removed "
 		    "when the run ends. With <b>Try to avoid downloading payload pieces</b> "
@@ -2532,13 +2816,19 @@ private:
 		    "invalid.</td></tr>"
 		    "<tr><td><tt>peer-banned</tt></td><td>libtorrent banned the peer for "
 		    "sending bad data.</td></tr>"
-		    "<tr><td><tt>peer-blocked</tt></td><td>Rejected by an IP or port "
-		    "filter, or by privileged port rules.</td></tr>"
+		    "<tr><td><tt>peer-blocked</tt></td><td>Rejected by libtorrent. This "
+		    "application sets no IP filter, so in practice these are hosts "
+		    "libtorrent banned on its own: DHT crawlers that connect asking for "
+		    "one of the decoy info hashes libtorrent plants in DHT traffic. They "
+		    "are not peers of the torrent.</td></tr>"
 		    "<tr><td><tt>peer-alert</tt></td><td>Found in the text of some other "
 		    "peer alert.</td></tr>"
 		    "</table>"
 		    "<h3>What is not recorded</h3>"
 		    "<ul>"
+		    "<li>This machine's own addresses. Trackers return the announcing "
+		    "peer in their reply, so every local interface address and the "
+		    "external address libtorrent reports are removed from the list.</li>"
 		    "<li>IPv6 peers are skipped everywhere.</li>"
 		    "<li>Peers a tracker or DHT returned that libtorrent never tried to "
 		    "contact. libtorrent reports counts for those, not addresses.</li>"
@@ -2548,25 +2838,25 @@ private:
 		    "usually most of a long run's list.</p>");
 
 		addHelpPage(pages, "Output",
-		    "<h3>File format</h3>"
+		    "<h3>List format</h3>"
 		    "<p>One peer per line, sorted by IP address and then port. With "
 		    "comments enabled every line looks like:</p>"
 		    "<pre>1.2.3.4:6881      # peer-connect-out; ipinfo: country=DE, city=Berlin, provider=AS3320 Deutsche Telekom</pre>"
 		    "<p>The <tt>#</tt> column is aligned: it starts five characters past "
 		    "the longest <tt>IP:port</tt> in the list. Source tags come first, "
 		    "separated by commas, then a semicolon, then the IPinfo fields. "
-		    "<tt>ipinfo=pending</tt> means the lookup had not run yet when the "
-		    "file was written; <tt>ipinfo=unavailable</tt> means it failed.</p>"
-		    "<p>Without comments the file is just the endpoints, ready to feed to "
+		    "<tt>ipinfo=pending</tt> means the lookup had not run yet; "
+		    "<tt>ipinfo=unavailable</tt> means it failed.</p>"
+		    "<p>Without comments the list is just the endpoints, ready to feed to "
 		    "another tool.</p>"
 		    "<h3>Buttons</h3>"
 		    "<table cellpadding='3' cellspacing='0'>"
 		    "<tr><td><b>Copy Peers</b></td><td>Copy the Seen / Known Peers tab to "
 		    "the clipboard.</td></tr>"
-		    "<tr><td><b>Open Output File</b></td><td>Load the output file from "
-		    "disk into the peers tab, for checking a previous run.</td></tr>"
+		    "<tr><td><b>Save Peers...</b></td><td>Write the peers tab, exactly as "
+		    "shown, to a file. The dialog opens in the folder used last time.</td></tr>"
 		    "<tr><td><b>Clear Log</b></td><td>Empty the Log tab. The peers tab "
-		    "and the file are untouched.</td></tr>"
+		    "is untouched.</td></tr>"
 		    "</table>"
 		    "<h3>Summary</h3>"
 		    "<p>When a run ends the Log tab shows a summary with the unique "
@@ -2627,8 +2917,16 @@ private:
 
 	void loadSettings()
 	{
+		QByteArray window_geometry;
+		int last_tab_index;
+
+		window_geometry = settings.value("ui/main_window_geometry").toByteArray();
+		if (!window_geometry.isEmpty()) {
+			restoreGeometry(window_geometry);
+		}
+
 		torrentPathEdit->setText(settings.value("paths/torrent", "").toString());
-		outputPathEdit->setText(settings.value("paths/output", QDir::currentPath() + "/peers.txt").toString());
+		lastPeersDir = settings.value("paths/peers_dir", "").toString();
 		runTimeSpin->setValue(settings.value("options/run_time", 300).toInt());
 		pollSpin->setValue(settings.value("options/poll_interval", 2.0).toDouble());
 		trackerReannounceSpin->setValue(settings.value("options/tracker_reannounce_interval", 300.0).toDouble());
@@ -2643,13 +2941,18 @@ private:
 		ipInfoCommentsCheck->setChecked(settings.value("options/ipinfo_comments", false).toBool());
 		ipInfoTokenEdit->clear();
 
+		last_tab_index = settings.value("ui/last_tab_index", 0).toInt();
+		if (tabs != nullptr && last_tab_index >= 0 && last_tab_index < tabs->count()) {
+			tabs->setCurrentIndex(last_tab_index);
+		}
+
 		updatePexAvailability();
 	}
 
 	void saveSettings()
 	{
 		settings.setValue("paths/torrent", torrentPathEdit->text().trimmed());
-		settings.setValue("paths/output", outputPathEdit->text().trimmed());
+		settings.setValue("paths/peers_dir", lastPeersDir);
 		settings.setValue("options/run_time", runTimeSpin->value());
 		settings.setValue("options/poll_interval", pollSpin->value());
 		settings.setValue("options/tracker_reannounce_interval", trackerReannounceSpin->value());
@@ -2665,6 +2968,9 @@ private:
 		settings.setValue("options/source_comments", sourceCommentsCheck->isChecked());
 		settings.setValue("options/ipinfo_comments", ipInfoCommentsCheck->isChecked());
 		/* IPinfo token is intentionally not saved. */
+
+		settings.setValue("ui/main_window_geometry", saveGeometry());
+		settings.setValue("ui/last_tab_index", tabs != nullptr ? tabs->currentIndex() : 0);
 		settings.sync();
 	}
 
@@ -2725,46 +3031,76 @@ private slots:
 
 		if (!path.isEmpty()) {
 			torrentPathEdit->setText(path);
-
-			if (outputPathEdit->text().trimmed().isEmpty()) {
-				outputPathEdit->setText(QFileInfo(path).absolutePath() + "/peers.txt");
-			}
-
 			saveSettings();
 		}
 	}
 
-	void browseOutput()
+	/* Folder the Save Peers dialog opens in: the last one used, else home. */
+	QString peersDialogDir() const
+	{
+		if (!lastPeersDir.isEmpty() && QDir(lastPeersDir).exists()) {
+			return lastPeersDir;
+		}
+
+		return QDir::homePath();
+	}
+
+	/*
+	 * Write the Seen / Known Peers tab as it stands, exactly what Copy Peers
+	 * puts on the clipboard. Nothing is written without this button.
+	 */
+	void savePeers()
 	{
 		QString path;
+		QString text;
+		QFile f;
+
+		text = peersText->toPlainText();
+
+		if (text.trimmed().isEmpty()) {
+			QMessageBox::information(this, "Nothing to save", "The peer list is empty.");
+			return;
+		}
 
 		path = QFileDialog::getSaveFileName(
 		    this,
-		    "Choose output peers.txt",
-		    outputPathEdit->text().trimmed().isEmpty() ? QDir::currentPath() + "/peers.txt" : outputPathEdit->text().trimmed(),
+		    "Save peers",
+		    peersDialogDir() + "/peers.txt",
 		    "Text files (*.txt);;All files (*)");
 
-		if (!path.isEmpty()) {
-			outputPathEdit->setText(path);
-			saveSettings();
+		if (path.isEmpty()) {
+			return;
 		}
+
+		f.setFileName(path);
+		if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) {
+			QMessageBox::warning(this, "Save failed", f.errorString());
+			return;
+		}
+
+		if (!text.endsWith('\n')) {
+			text += '\n';
+		}
+
+		f.write(text.toUtf8());
+		f.close();
+
+		lastPeersDir = QFileInfo(path).absolutePath();
+		saveSettings();
+
+		statusLabel->setText(QString("Saved %1 line(s) to %2")
+		                         .arg(text.count('\n'))
+		                         .arg(path));
 	}
 
 	void startCollection()
 	{
 		QString torrent_path;
-		QString output_path;
 
 		torrent_path = torrentPathEdit->text().trimmed();
-		output_path = outputPathEdit->text().trimmed();
 
 		if (torrent_path.isEmpty()) {
 			QMessageBox::warning(this, "Missing torrent", "Choose a .torrent file.");
-			return;
-		}
-
-		if (output_path.isEmpty()) {
-			QMessageBox::warning(this, "Missing output", "Choose output peers.txt path.");
 			return;
 		}
 
@@ -2797,7 +3133,6 @@ private slots:
 
 		worker = new PeerCollectorThread(
 		    torrent_path,
-		    output_path,
 		    runTimeSpin->value(),
 		    pollSpin->value(),
 		    trackerReannounceSpin->value(),
@@ -2915,39 +3250,21 @@ private slots:
 		QApplication::clipboard()->setText(peersText->toPlainText());
 		statusLabel->setText("Peers copied to clipboard.");
 	}
-
-	void openOutputFile()
-	{
-		QString path;
-		QFile f;
-
-		path = outputPathEdit->text().trimmed();
-
-		if (path.isEmpty()) {
-			QMessageBox::information(this, "No output path", "No output file selected.");
-			return;
-		}
-
-		if (!QFileInfo::exists(path)) {
-			QMessageBox::information(this, "File not found", "Output file does not exist yet:\n" + path);
-			return;
-		}
-
-		f.setFileName(path);
-		if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) {
-			QMessageBox::warning(this, "Read failed", f.errorString());
-			return;
-		}
-
-		peersText->setPlainText(QString::fromUtf8(f.readAll()));
-		tabs->setCurrentWidget(peersText);
-		statusLabel->setText("Loaded output file: " + path);
-	}
 };
 
 int main(int argc, char **argv)
 {
 	QApplication app(argc, argv);
+
+	/*
+	 * Identity for anything that derives a path from the application rather
+	 * than being told one, such as QStandardPaths or a bare QSettings(). The
+	 * settings member is built from the same two names, so the settings key
+	 * and the per-user data folder stay in step and both follow the defines.
+	 */
+	QCoreApplication::setOrganizationName(CONFIG_FOLDER_NAME);
+	QCoreApplication::setApplicationName(APP_NAME);
+
 	MainWindow win;
 
 	win.show();
