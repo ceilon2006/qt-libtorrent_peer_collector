@@ -28,7 +28,7 @@
   --red-bg: #fbe4e2;
   --red-edge: #c8322d;
 
-  --measure: 72ch;
+  --measure: 110ch;
   --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", sans-serif;
   --mono: ui-monospace, SFMono-Regular, "Cascadia Mono", Consolas, "DejaVu Sans Mono", monospace;
 }
@@ -90,6 +90,42 @@ body {
 main {
   max-width: var(--measure);
   margin: 0 auto;
+  transition: max-width .15s ease;
+}
+:root[data-width="narrow"] main { max-width: 72ch; }
+:root[data-width="wide"]   main { max-width: 110ch; }
+:root[data-width="full"]   main { max-width: none; }
+
+.width-control {
+  position: fixed;
+  top: 12px;
+  right: 16px;
+  display: flex;
+  gap: 2px;
+  padding: 3px;
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  font-size: .8rem;
+  z-index: 10;
+}
+.width-control button {
+  font: inherit;
+  color: var(--ink-2);
+  background: none;
+  border: 0;
+  border-radius: 4px;
+  padding: .2rem .55rem;
+  cursor: pointer;
+}
+.width-control button:hover { color: var(--ink); background: var(--surface-2); }
+.width-control button[aria-pressed="true"] {
+  color: var(--ink);
+  background: var(--surface-2);
+  font-weight: 600;
+}
+@media (max-width: 720px) {
+  .width-control { display: none; }
 }
 h1 {
   font-size: 2rem;
@@ -195,6 +231,11 @@ footer {
 </style>
 </head>
 <body>
+<div class="width-control" role="group" aria-label="Page width">
+  <button type="button" data-width="narrow">Narrow</button>
+  <button type="button" data-width="wide">Wide</button>
+  <button type="button" data-width="full">Full</button>
+</div>
 <main>
 
 <h1>Build Requirements</h1>
@@ -568,5 +609,37 @@ scripts\windows\deploy.bat</code></pre>
 </footer>
 
 </main>
+<script>
+(function () {
+  var root = document.documentElement;
+  var buttons = document.querySelectorAll('.width-control button');
+  var key = 'build-requirements.width';
+
+  function apply(width) {
+    root.setAttribute('data-width', width);
+    for (var i = 0; i < buttons.length; i++) {
+      buttons[i].setAttribute('aria-pressed', buttons[i].getAttribute('data-width') === width ? 'true' : 'false');
+    }
+  }
+
+  var saved = 'wide';
+  try {
+    saved = localStorage.getItem(key) || 'wide';
+  } catch (e) {
+  }
+  apply(saved);
+
+  for (var i = 0; i < buttons.length; i++) {
+    buttons[i].addEventListener('click', function () {
+      var width = this.getAttribute('data-width');
+      apply(width);
+      try {
+        localStorage.setItem(key, width);
+      } catch (e) {
+      }
+    });
+  }
+})();
+</script>
 </body>
 </html>
