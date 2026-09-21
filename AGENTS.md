@@ -16,7 +16,12 @@ Peer sources, each tagged in the output:
 |---------------------------|------------------------------------------------------------------|
 | `connected/get_peer_info` | `torrent_handle::get_peer_info()` every poll                     |
 | `tracker-direct-http`     | Hand-rolled HTTP/HTTPS announce done by this app, bypassing libtorrent |
-| `tracker-alert`, `dht-alert`, `pex-alert`, `peer-alert`, `alert` | IPv4:port strings regex-scraped from `alert::message()` text |
+| `peer-connect-in/out`     | `peer_connect_alert`, handshake completed                        |
+| `peer-connect-failed`     | `peer_disconnected_alert` with `op == operation_t::connect`      |
+| `peer-disconnected`       | any other `peer_disconnected_alert`                              |
+| `peer-incoming`           | `incoming_connection_alert`, pre-handshake                       |
+| `peer-error` / `peer-banned` / `peer-blocked` | the matching alert types                     |
+| `peer-alert`              | IPv4:port regex-scraped from any other peer-category alert text  |
 
 Optional per-IP enrichment via the IPinfo REST API (`ipinfo.io/<ip>/json`).
 
@@ -63,15 +68,22 @@ commit them. There are no tests, no CI, and no README.
 3. **IPinfo lookup.** Same blocking GET pattern, 4 s timeout, results cached
    per IP in memory for the run. Handles both legacy (`country`, `org`) and
    Lite (`country_code`, `asn{}` object) response shapes.
-4. **`PeerCollectorThread : QThread`.** All libtorrent work happens in `run()`.
+4. **Alert classification.** `classifyPeerAlert` maps alert types to an
+   endpoint and a source tag with `alert_cast`. `shouldLogAlert` decides what
+   reaches the Log tab (error/tracker/dht/status plus error/ban/block peer
+   alerts; connect/disconnect are too frequent to log).
+5. **`PeerCollectorThread : QThread`.** All libtorrent work happens in `run()`.
    Communicates with the GUI only through signals (`logMessage`,
    `peerCountChanged`, `peersPreviewChanged`, `progressChanged`,
    `finishedStatus`). Stop is cooperative via `std::atomic<bool>`.
-5. **`MainWindow : QMainWindow`.** Form of options, Start/Stop, Log and Peers
+6. **`MainWindow : QMainWindow`.** Form of options, Start/Stop, Log and Peers
    tabs, progress bar. Persists options with `QSettings("IRT",
    "LibtorrentPeerCollectorCppQt")`. The IPinfo token is deliberately never
-   saved.
-6. **`main()`.**
+   saved. Help button and F1 open a non-modal tabbed `QDialog` built by
+   `showHelpDialog` / `addHelpPage`, same pattern as the sibling
+   `qt-p2p_filter_generator` and `qt-web_selector` projects. Keep the help
+   text in step with the options and tags it describes.
+7. **`main()`.**
 
 ## Runtime behaviour worth knowing
 
@@ -95,24 +107,21 @@ commit them. There are no tests, no CI, and no README.
 
 Check these before assuming the code does what its log messages claim.
 
-- **Alert mask.** The worker sets `alert_mask` to error, peer, tracker, dht
-  and status (libtorrent 2.0 defaults to error only). Only the `peer`
-  category produces alert messages containing endpoints, so `peer-alert` is
-  the tag that actually gains peers. `tracker-alert` and `dht-alert` messages
-  carry URLs and counts, not addresses. A tracker with a raw-IP URL will be
-  scraped as a "peer" from tracker alerts. Do not add `peer_log` unless you
-  also stop echoing every "peer" alert to the Log tab.
+- **Alert mask.** The worker sets `alert_mask` to error, connect, peer,
+  ip_block, tracker, dht and status (libtorrent 2.0 defaults to error only).
+  Note `peer_connect_alert` and `peer_disconnected_alert` are in the
+  `connect` category, not `peer`. tracker/dht alerts carry URLs and counts,
+  not addresses, so they only feed the log. Do not add `peer_log` unless you
+  also tighten `shouldLogAlert`.
 - **PEX checkbox is cosmetic.** `enablePex` is only logged. In libtorrent 2.0
   PEX is the `ut_pex` plugin; disabling it means constructing the session
   without default plugins (`session_params` flags) and adding only the ones
   you want, not a `settings_pack` key.
-- `buildPeerSummaryText` computes `countPeersWithSourcePrefix(peer_sources, "")`
-  and immediately discards it. Dead code, harmless.
 - Listen port spin box allows 0, which yields `listen_interfaces = 0.0.0.0:0`.
 - `directAnnounceAllHttpTrackers` is called twice on startup (once before the
   loop, once in the first poll iteration).
-- Source tagging of alerts is by substring on the lowercased message
-  (`"tracker"`, `"dht"`, `"pex"`, `"peer"`), so classification is heuristic.
+- Only peer-category alerts that `classifyPeerAlert` does not handle are
+  regex-scraped, so a tracker URL with a raw IP is never mistaken for a peer.
 
 ## Conventions
 

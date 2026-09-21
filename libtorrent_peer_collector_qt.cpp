@@ -34,6 +34,8 @@
 
 #include <QtWidgets/QApplication>
 #include <QtWidgets/QCheckBox>
+#include <QtWidgets/QDialog>
+#include <QtWidgets/QDialogButtonBox>
 #include <QtWidgets/QDoubleSpinBox>
 #include <QtWidgets/QFileDialog>
 #include <QtWidgets/QFormLayout>
@@ -49,6 +51,7 @@
 #include <QtWidgets/QPushButton>
 #include <QtWidgets/QSpinBox>
 #include <QtWidgets/QTabWidget>
+#include <QtWidgets/QTextBrowser>
 #include <QtWidgets/QVBoxLayout>
 #include <QtWidgets/QWidget>
 
@@ -60,6 +63,7 @@
 #include <QtCore/QIODevice>
 #include <QtCore/QUrlQuery>
 #include <QtCore/QJsonValue>
+#include <QtCore/QPointer>
 #include <QtCore/QJsonObject>
 #include <QtCore/QJsonDocument>
 #include <QtCore/QRegularExpression>
@@ -72,6 +76,7 @@
 #include <QtGui/QClipboard>
 #include <QtGui/QFont>
 #include <QtGui/QCloseEvent>
+#include <QtGui/QShortcut>
 #include <QtNetwork/QNetworkAccessManager>
 #include <QtNetwork/QNetworkReply>
 #include <QtNetwork/QNetworkRequest>
@@ -431,50 +436,41 @@ static QString buildPeerSummaryText(const std::set<QString> &peers,
 {
 	int connected = countPeersWithSource(peer_sources, "connected/get_peer_info");
 	int tracker_direct = countPeersWithSource(peer_sources, "tracker-direct-http");
-	int tracker_alert = countPeersWithSource(peer_sources, "tracker-alert");
-	int dht_alert = countPeersWithSource(peer_sources, "dht-alert");
-	int pex_alert = countPeersWithSource(peer_sources, "pex-alert");
-	int peer_alert = countPeersWithSource(peer_sources, "peer-alert");
-	int any_alert = countPeersWithSourcePrefix(peer_sources, "");
+	int connect_in = countPeersWithSource(peer_sources, "peer-connect-in");
+	int connect_out = countPeersWithSource(peer_sources, "peer-connect-out");
+	int connect_failed = countPeersWithSource(peer_sources, "peer-connect-failed");
+	int disconnected = countPeersWithSource(peer_sources, "peer-disconnected");
+	int incoming = countPeersWithSource(peer_sources, "peer-incoming");
+	int error_ban_block = countPeersWithSource(peer_sources, "peer-error") +
+	                      countPeersWithSource(peer_sources, "peer-banned") +
+	                      countPeersWithSource(peer_sources, "peer-blocked");
+	int other_alert = countPeersWithSource(peer_sources, "peer-alert");
+	int any_alert = countPeersWithSourcePrefix(peer_sources, "peer-");
 	int unknown = countPeersWithoutKnownSource(peers, peer_sources);
-
-	/*
-	 * any_alert above counts all sources, not only alert sources. Recalculate alert-only below.
-	 */
-	any_alert = 0;
-	for (const auto &item : peer_sources) {
-		bool matched = false;
-
-		for (const QString &source : item.second) {
-			if (source.endsWith("-alert") || source == "alert") {
-				matched = true;
-				break;
-			}
-		}
-
-		if (matched) {
-			any_alert++;
-		}
-	}
 
 	return QString(
 	    "Peer summary:\n"
 	    "  Total unique peers       : %1\n"
 	    "  Connected/get_peer_info  : %2\n"
 	    "  Direct HTTP tracker      : %3\n"
-	    "  Tracker alert            : %4\n"
-	    "  DHT alert                : %5\n"
-	    "  PEX alert                : %6\n"
-	    "  Other peer alert         : %7\n"
-	    "  Any alert source         : %8\n"
-	    "  Unknown/no source tag    : %9\n")
+	    "  Connected in / out       : %4 / %5\n"
+	    "  Connect failed           : %6\n"
+	    "  Disconnected             : %7\n"
+	    "  Incoming (pre-handshake) : %8\n"
+	    "  Error/banned/blocked     : %9\n"
+	    "  Other peer alert         : %10\n"
+	    "  Any peer alert source    : %11\n"
+	    "  Unknown/no source tag    : %12\n")
 	    .arg(peers.size())
 	    .arg(connected)
 	    .arg(tracker_direct)
-	    .arg(tracker_alert)
-	    .arg(dht_alert)
-	    .arg(pex_alert)
-	    .arg(peer_alert)
+	    .arg(connect_in)
+	    .arg(connect_out)
+	    .arg(connect_failed)
+	    .arg(disconnected)
+	    .arg(incoming)
+	    .arg(error_ban_block)
+	    .arg(other_alert)
 	    .arg(any_alert)
 	    .arg(unknown);
 }
@@ -1070,6 +1066,105 @@ static int ensureIpInfoForPeers(const std::set<QString> &peers,
 
 
 /* ------------------------------------------------------------------------- */
+/* Alert classification                                                       */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * Map a libtorrent alert to a peer endpoint and a source tag by alert type.
+ *
+ * Returns true when the alert is a peer-level type this collector understands.
+ * In that case *endpoint is the IPv4:port text, or empty for IPv6 peers, and
+ * *source is the tag to record for it.
+ *
+ * Tags:
+ *   peer-connect-in      incoming connection completed handshake
+ *   peer-connect-out     outgoing connection completed handshake
+ *   peer-connect-failed  outgoing connection attempt failed (never connected)
+ *   peer-disconnected    a connected peer went away, any reason
+ *   peer-incoming        raw incoming TCP/uTP connection, before handshake
+ *   peer-error           protocol error from a peer
+ *   peer-banned          peer was banned
+ *   peer-blocked         peer rejected by IP filter/port filter/etc.
+ */
+static bool classifyPeerAlert(lt::alert *a, QString *endpoint, QString *source)
+{
+	if (endpoint == nullptr || source == nullptr) {
+		return false;
+	}
+
+	if (auto *pc = lt::alert_cast<lt::peer_connect_alert>(a)) {
+		*endpoint = ipPortToText(pc->endpoint);
+		*source = (pc->direction == lt::peer_connect_alert::direction_t::in)
+		              ? "peer-connect-in"
+		              : "peer-connect-out";
+		return true;
+	}
+
+	if (auto *pd = lt::alert_cast<lt::peer_disconnected_alert>(a)) {
+		*endpoint = ipPortToText(pd->endpoint);
+
+		if (pd->op == lt::operation_t::connect) {
+			*source = "peer-connect-failed";
+		} else {
+			*source = "peer-disconnected";
+		}
+		return true;
+	}
+
+	if (auto *ic = lt::alert_cast<lt::incoming_connection_alert>(a)) {
+		*endpoint = ipPortToText(ic->endpoint);
+		*source = "peer-incoming";
+		return true;
+	}
+
+	if (auto *pe = lt::alert_cast<lt::peer_error_alert>(a)) {
+		*endpoint = ipPortToText(pe->endpoint);
+		*source = "peer-error";
+		return true;
+	}
+
+	if (auto *pb = lt::alert_cast<lt::peer_ban_alert>(a)) {
+		*endpoint = ipPortToText(pb->endpoint);
+		*source = "peer-banned";
+		return true;
+	}
+
+	if (auto *pk = lt::alert_cast<lt::peer_blocked_alert>(a)) {
+		*endpoint = ipPortToText(pk->endpoint);
+		*source = "peer-blocked";
+		return true;
+	}
+
+	return false;
+}
+
+/*
+ * Decide which alerts go to the Log tab.
+ *
+ * Connect/disconnect alerts are far too frequent to log one by one. Their
+ * effect is visible in the peer list and summary instead.
+ */
+static bool shouldLogAlert(lt::alert *a)
+{
+	lt::alert_category_t cat = a->category();
+
+	if (cat & (lt::alert_category::error |
+	           lt::alert_category::tracker |
+	           lt::alert_category::dht |
+	           lt::alert_category::status)) {
+		return true;
+	}
+
+	if (lt::alert_cast<lt::peer_error_alert>(a) != nullptr ||
+	    lt::alert_cast<lt::peer_ban_alert>(a) != nullptr ||
+	    lt::alert_cast<lt::peer_blocked_alert>(a) != nullptr) {
+		return true;
+	}
+
+	return false;
+}
+
+/* ------------------------------------------------------------------------- */
 /* Worker thread                                                              */
 /* ------------------------------------------------------------------------- */
 
@@ -1187,17 +1282,24 @@ protected:
 			/*
 			 * Alert mask.
 			 *
-			 * libtorrent 2.0 defaults alert_mask to error only. The alert
-			 * scraping below needs the peer category to see endpoints of peers
-			 * that connect/disconnect between polls or fail to connect at all.
-			 * tracker/dht/status are for the log; their messages carry counts
-			 * and URLs, not peer endpoints.
+			 * libtorrent 2.0 defaults alert_mask to error only.
+			 *
+			 *   connect  : peer_connect_alert, peer_disconnected_alert.
+			 *              These carry the endpoint of every peer libtorrent
+			 *              tries, including ones that never connect.
+			 *   peer     : incoming_connection_alert, peer_error_alert,
+			 *              peer_ban_alert, snubbed/unsnubbed.
+			 *   ip_block : peer_blocked_alert.
+			 *   tracker/dht/status/error : for the log only. Their messages
+			 *              carry URLs and counts, not peer endpoints.
 			 */
 			pack.set_int(
 			    lt::settings_pack::alert_mask,
 			    static_cast<int>(
 			        lt::alert_category::error |
+			        lt::alert_category::connect |
 			        lt::alert_category::peer |
+			        lt::alert_category::ip_block |
 			        lt::alert_category::tracker |
 			        lt::alert_category::dht |
 			        lt::alert_category::status));
@@ -1396,32 +1498,36 @@ protected:
 					ses.pop_alerts(&alerts);
 
 					for (lt::alert *a : alerts) {
-						QString s = QString::fromStdString(a->message());
-						QString lower = s.toLower();
+						QString endpoint;
+						QString source;
 
-						QString source = "alert";
-						if (lower.contains("tracker")) {
-							source = "tracker-alert";
-						} else if (lower.contains("dht")) {
-							source = "dht-alert";
-						} else if (lower.contains("pex")) {
-							source = "pex-alert";
-						} else if (lower.contains("peer")) {
-							source = "peer-alert";
+						if (classifyPeerAlert(a, &endpoint, &source)) {
+							/*
+							 * Known peer-level alert type. Endpoint is empty
+							 * for IPv6 peers, which this tool skips.
+							 */
+							if (!endpoint.isEmpty()) {
+								peers.insert(endpoint);
+								peerSources[endpoint].insert(source);
+							}
+						} else if (a->category() & lt::alert_category::peer) {
+							/*
+							 * Other peer-category alert (snubbed, invalid
+							 * request, ...). Scrape the message text. Only
+							 * peer-category alerts are scraped so tracker
+							 * URLs with raw IPs are never mistaken for peers.
+							 */
+							QString s = QString::fromStdString(a->message());
+							QStringList alert_peers = extractIpv4PortsFromText(s);
+
+							for (const QString &p : alert_peers) {
+								peers.insert(p);
+								peerSources[p].insert("peer-alert");
+							}
 						}
 
-						QStringList alert_peers = extractIpv4PortsFromText(s);
-						for (const QString &p : alert_peers) {
-							peers.insert(p);
-							peerSources[p].insert(source);
-						}
-
-						if (lower.contains("tracker") ||
-						    lower.contains("error") ||
-						    lower.contains("dht") ||
-						    lower.contains("listen") ||
-						    lower.contains("peer")) {
-							emit logMessage(s);
+						if (shouldLogAlert(a)) {
+							emit logMessage(QString::fromStdString(a->message()));
 						}
 					}
 				} catch (...) {
@@ -1573,6 +1679,14 @@ public:
 		statusLabel = new QLabel("Ready.", this);
 		main_layout->addWidget(statusLabel);
 
+		/* F1 is the usual help key. It does the same as the Help button. */
+		QShortcut *help_shortcut;
+
+		help_shortcut = new QShortcut(QKeySequence(Qt::Key_F1), this);
+		connect(help_shortcut, &QShortcut::activated, this, [this]() {
+			showHelpDialog();
+		});
+
 		loadSettings();
 	}
 
@@ -1632,6 +1746,14 @@ private:
 	QLineEdit *ipInfoTokenEdit = nullptr;
 	QPushButton *startButton = nullptr;
 	QPushButton *stopButton = nullptr;
+	QPushButton *helpButton = nullptr;
+
+	/*
+	 * The help window is not modal, so the collector can be driven while it
+	 * is open. Only one is ever built: a second Help click raises this one.
+	 */
+	QPointer<QDialog> helpDialog;
+
 	QPlainTextEdit *logText = nullptr;
 	QPlainTextEdit *peersText = nullptr;
 	QTabWidget *tabs = nullptr;
@@ -1770,6 +1892,7 @@ private:
 		copy_peers = new QPushButton("Copy Peers", this);
 		open_output = new QPushButton("Open Output File", this);
 		clear_log = new QPushButton("Clear Log", this);
+		helpButton = new QPushButton("Help", this);
 
 		startButton->setStyleSheet("font-weight: bold;");
 		stopButton->setEnabled(false);
@@ -1779,6 +1902,7 @@ private:
 		row->addWidget(copy_peers);
 		row->addWidget(open_output);
 		row->addWidget(clear_log);
+		row->addWidget(helpButton);
 		row->addStretch(1);
 
 		parent->addLayout(row);
@@ -1792,6 +1916,235 @@ private:
 				logText->clear();
 			}
 		});
+		connect(helpButton, &QPushButton::clicked, this, [this]() {
+			showHelpDialog();
+		});
+	}
+
+	/*
+	 * One help page. The view is frameless because the tab widget already
+	 * draws a border around it. The colours are pinned so a theme that changes
+	 * the base colour without the text leaves the page readable.
+	 */
+	void addHelpPage(QTabWidget *pages, const QString &title, const QString &body)
+	{
+		QTextBrowser *view;
+
+		view = new QTextBrowser(pages);
+		view->setOpenExternalLinks(false);
+		view->setFrameShape(QFrame::NoFrame);
+		view->setStyleSheet("QTextBrowser {"
+		                    "  background-color: #ffffff;"
+		                    "  color: #000000;"
+		                    "  selection-background-color: #cfe8ff;"
+		                    "  selection-color: #000000;"
+		                    "}");
+		view->document()->setDefaultStyleSheet(
+		    "body { color: #000000; }"
+		    "h3 { color: #000000; }"
+		    "p { color: #000000; }"
+		    "li { color: #000000; }"
+		    "td { color: #000000; }"
+		    "b { color: #000000; }"
+		    "i { color: #000000; }"
+		    "tt { color: #000000; }"
+		    "pre { color: #000000; background-color: #f4f4f4; }");
+		view->setHtml("<body>" + body + "</body>");
+		pages->addTab(view, title);
+	}
+
+	/*
+	 * Help is a reference document, not a message: one tab per reason to open
+	 * it, rich text, not modal, one instance, its size remembered.
+	 */
+	void showHelpDialog()
+	{
+		QDialog *dialog;
+		QVBoxLayout *layout;
+		QTabWidget *pages;
+		QDialogButtonBox *buttons;
+		QByteArray geometry;
+
+		if (!helpDialog.isNull()) {
+			helpDialog->show();
+			helpDialog->raise();
+			helpDialog->activateWindow();
+			return;
+		}
+
+		dialog = new QDialog(this);
+		dialog->setWindowTitle("Help");
+		dialog->setAttribute(Qt::WA_DeleteOnClose);
+
+		layout = new QVBoxLayout(dialog);
+		pages = new QTabWidget(dialog);
+		buttons = new QDialogButtonBox(QDialogButtonBox::Close, dialog);
+
+		addHelpPage(pages, "Overview",
+		    "<h3>What the application does</h3>"
+		    "<p>Libtorrent Peer Collector opens a <tt>.torrent</tt> file in a real "
+		    "libtorrent session for a fixed time and records every IPv4 peer it "
+		    "sees: peers returned by trackers, found through DHT, exchanged over "
+		    "PEX, discovered on the local network, and every peer libtorrent "
+		    "tries to connect to, whether the connection succeeds or not.</p>"
+		    "<p>The result is a plain text file, one <tt>IP:port</tt> per line, "
+		    "with an optional comment saying where each peer was seen.</p>"
+		    "<h3>The usual flow</h3>"
+		    "<ol>"
+		    "<li>Choose a <b>Torrent file</b> and an <b>Output peers.txt</b> path.</li>"
+		    "<li>Set the <b>Run time</b>. Longer runs find more peers.</li>"
+		    "<li>Press <b>Start Collection</b>.</li>"
+		    "<li>Watch the <b>Log</b> tab for tracker and DHT activity and the "
+		    "<b>Seen / Known Peers</b> tab for the growing list.</li>"
+		    "<li>The output file is rewritten every 10 seconds and once more at "
+		    "the end, so stopping early still leaves a complete file.</li>"
+		    "</ol>"
+		    "<h3>While it runs</h3>"
+		    "<p><b>Stop</b> asks the collector to finish its current poll cycle "
+		    "and then save. A cycle can take a while when a tracker or the IPinfo "
+		    "service is slow to answer, so Stop is not instant.</p>"
+		    "<p>Torrent data is written to a temporary directory that is removed "
+		    "when the run ends. With <b>Try to avoid downloading payload pieces</b> "
+		    "checked, every file and piece is set to <i>do not download</i>, so "
+		    "the session connects to peers without pulling their data.</p>");
+
+		addHelpPage(pages, "Options",
+		    "<h3>Timing</h3>"
+		    "<table cellpadding='3' cellspacing='0'>"
+		    "<tr><td><b>Run time</b></td><td>How long the session stays open. "
+		    "10 seconds to 24 hours.</td></tr>"
+		    "<tr><td><b>Peer poll interval</b></td><td>How often connected peers "
+		    "and libtorrent alerts are read. Minimum 0.2 seconds.</td></tr>"
+		    "<tr><td><b>Tracker reannounce interval</b></td><td>How often trackers "
+		    "are asked again, both through libtorrent and by the direct HTTP "
+		    "announce. Floor of 30 seconds: trackers rate-limit announces.</td></tr>"
+		    "<tr><td><b>DHT reannounce interval</b></td><td>How often a DHT "
+		    "announce is forced. Same 30 second floor.</td></tr>"
+		    "</table>"
+		    "<h3>Network</h3>"
+		    "<table cellpadding='3' cellspacing='0'>"
+		    "<tr><td><b>Listen port</b></td><td>TCP/uTP port libtorrent listens "
+		    "on and reports to trackers. UPnP and NAT-PMP are always attempted so "
+		    "incoming connections can reach it.</td></tr>"
+		    "</table>"
+		    "<h3>Discovery</h3>"
+		    "<table cellpadding='3' cellspacing='0'>"
+		    "<tr><td><b>Trackers</b></td><td>Announce to the trackers in the "
+		    "torrent. Unchecking clears the tracker list for this run.</td></tr>"
+		    "<tr><td><b>DHT</b></td><td>Enable the distributed hash table, "
+		    "bootstrapped from the usual public router nodes.</td></tr>"
+		    "<tr><td><b>PEX</b></td><td>Peer exchange. Only works after at least "
+		    "one peer is connected, so it needs Trackers, DHT or LSD. This "
+		    "libtorrent build does not expose a PEX switch; the box records the "
+		    "intent and is logged, but PEX stays at libtorrent's default.</td></tr>"
+		    "<tr><td><b>LSD</b></td><td>Local service discovery on the LAN.</td></tr>"
+		    "</table>"
+		    "<h3>Comments</h3>"
+		    "<table cellpadding='3' cellspacing='0'>"
+		    "<tr><td><b>Print peer source</b></td><td>Append the source tags for "
+		    "each peer as a <tt>#</tt> comment. See the Peer Sources page.</td></tr>"
+		    "<tr><td><b>Print IPinfo</b></td><td>Look up country, city, provider "
+		    "and hostname for each IP at ipinfo.io and append it to the comment. "
+		    "Each IP is looked up once per run. Without a token the free tier "
+		    "applies and lookups may be refused after a few hundred.</td></tr>"
+		    "<tr><td><b>IPinfo token</b></td><td>Optional. Used only for this run "
+		    "and never written to settings.</td></tr>"
+		    "</table>"
+		    "<p>All other options are remembered between runs.</p>");
+
+		addHelpPage(pages, "Peer Sources",
+		    "<h3>Where a peer can come from</h3>"
+		    "<p>Every peer carries one or more tags. A peer with several tags was "
+		    "seen more than one way.</p>"
+		    "<table cellpadding='3' cellspacing='0'>"
+		    "<tr><td><tt>connected/get_peer_info</tt></td><td>Was in libtorrent's "
+		    "connected peer list at the moment of a poll.</td></tr>"
+		    "<tr><td><tt>tracker-direct-http</tt></td><td>Returned by an HTTP or "
+		    "HTTPS tracker to this application's own announce, made alongside "
+		    "libtorrent's. UDP trackers are not queried this way.</td></tr>"
+		    "<tr><td><tt>peer-connect-out</tt></td><td>libtorrent connected to the "
+		    "peer and completed the handshake.</td></tr>"
+		    "<tr><td><tt>peer-connect-in</tt></td><td>The peer connected to us and "
+		    "completed the handshake.</td></tr>"
+		    "<tr><td><tt>peer-connect-failed</tt></td><td>libtorrent tried to "
+		    "connect and failed. The address came from a tracker, DHT, PEX or LSD "
+		    "but the peer was unreachable.</td></tr>"
+		    "<tr><td><tt>peer-disconnected</tt></td><td>A connected peer went "
+		    "away, for any reason.</td></tr>"
+		    "<tr><td><tt>peer-incoming</tt></td><td>An incoming connection "
+		    "arrived, before any handshake.</td></tr>"
+		    "<tr><td><tt>peer-error</tt></td><td>The peer sent something "
+		    "invalid.</td></tr>"
+		    "<tr><td><tt>peer-banned</tt></td><td>libtorrent banned the peer for "
+		    "sending bad data.</td></tr>"
+		    "<tr><td><tt>peer-blocked</tt></td><td>Rejected by an IP or port "
+		    "filter, or by privileged port rules.</td></tr>"
+		    "<tr><td><tt>peer-alert</tt></td><td>Found in the text of some other "
+		    "peer alert.</td></tr>"
+		    "</table>"
+		    "<h3>What is not recorded</h3>"
+		    "<ul>"
+		    "<li>IPv6 peers are skipped everywhere.</li>"
+		    "<li>Peers a tracker or DHT returned that libtorrent never tried to "
+		    "contact. libtorrent reports counts for those, not addresses.</li>"
+		    "</ul>"
+		    "<p>A peer that appears with only <tt>peer-connect-failed</tt> is "
+		    "still a real address that was advertised for this torrent. That is "
+		    "usually most of a long run's list.</p>");
+
+		addHelpPage(pages, "Output",
+		    "<h3>File format</h3>"
+		    "<p>One peer per line, sorted by IP address and then port. With "
+		    "comments enabled every line looks like:</p>"
+		    "<pre>1.2.3.4:6881      # peer-connect-out; ipinfo: country=DE, city=Berlin, provider=AS3320 Deutsche Telekom</pre>"
+		    "<p>The <tt>#</tt> column is aligned: it starts five characters past "
+		    "the longest <tt>IP:port</tt> in the list. Source tags come first, "
+		    "separated by commas, then a semicolon, then the IPinfo fields. "
+		    "<tt>ipinfo=pending</tt> means the lookup had not run yet when the "
+		    "file was written; <tt>ipinfo=unavailable</tt> means it failed.</p>"
+		    "<p>Without comments the file is just the endpoints, ready to feed to "
+		    "another tool.</p>"
+		    "<h3>Buttons</h3>"
+		    "<table cellpadding='3' cellspacing='0'>"
+		    "<tr><td><b>Copy Peers</b></td><td>Copy the Seen / Known Peers tab to "
+		    "the clipboard.</td></tr>"
+		    "<tr><td><b>Open Output File</b></td><td>Load the output file from "
+		    "disk into the peers tab, for checking a previous run.</td></tr>"
+		    "<tr><td><b>Clear Log</b></td><td>Empty the Log tab. The peers tab "
+		    "and the file are untouched.</td></tr>"
+		    "</table>"
+		    "<h3>Summary</h3>"
+		    "<p>When a run ends the Log tab shows a summary with the unique "
+		    "total and a count per source tag.</p>");
+
+		addHelpPage(pages, "Shortcuts",
+		    "<h3>Keyboard</h3>"
+		    "<table cellpadding='3' cellspacing='0'>"
+		    "<tr><td><b>F1</b></td><td>Open this help</td></tr>"
+		    "<tr><td><b>Esc</b></td><td>Close this help</td></tr>"
+		    "</table>"
+		    "<p>The help window is not modal. It can stay open while a "
+		    "collection runs.</p>");
+
+		layout->addWidget(pages, 1);
+		layout->addWidget(buttons);
+
+		connect(buttons, &QDialogButtonBox::rejected, dialog, &QDialog::close);
+
+		/* Escape, the Close button and the window close all end up here. */
+		connect(dialog, &QDialog::finished, this, [this, dialog]() {
+			settings.setValue("ui/help_geometry", dialog->saveGeometry());
+		});
+
+		geometry = settings.value("ui/help_geometry").toByteArray();
+		if (!geometry.isEmpty()) {
+			dialog->restoreGeometry(geometry);
+		} else {
+			dialog->resize(680, 600);
+		}
+
+		helpDialog = dialog;
+		dialog->show();
 	}
 
 	void createTabs(QVBoxLayout *parent)
