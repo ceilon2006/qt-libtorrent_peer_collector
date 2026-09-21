@@ -16,6 +16,7 @@ Peer sources, each tagged in the output:
 |---------------------------|------------------------------------------------------------------|
 | `connected/get_peer_info` | `torrent_handle::get_peer_info()` every poll                     |
 | `tracker-direct-http`     | Hand-rolled HTTP/HTTPS announce done by this app, bypassing libtorrent |
+| `tracker-direct-udp`      | Same over UDP (BEP 15): connect + announce on a `QUdpSocket`          |
 | `peer-connect-in/out`     | `peer_connect_alert`, handshake completed                        |
 | `peer-connect-failed`     | `peer_disconnected_alert` with `op == operation_t::connect`      |
 | `peer-disconnected`       | any other `peer_disconnected_alert`                              |
@@ -71,10 +72,16 @@ the binary) is gitignored. There are no tests, no CI, and no README.
    `std::map<QString, std::set<QString>>` peer sources. Output lines are
    `IP:port<pad># source, source; ipinfo: …` with the `#` column aligned to
    longest endpoint + 5.
-2. **Direct HTTP tracker announce.** Builds a BEP 3 announce URL by hand, does a
-   blocking `QNetworkAccessManager` GET inside a local `QEventLoop` (15 s
-   timeout), and parses only the compact `5:peers` byte string with a minimal
-   bencode reader. UDP trackers are skipped. Not a general bencode parser.
+2. **Direct tracker announce.** `DirectAnnounceContext` holds one peer id and
+   key for the run plus the set of trackers that already got `started`.
+   HTTP/HTTPS: BEP 3 URL built by hand, blocking `QNetworkAccessManager` GET
+   inside a local `QEventLoop` (15 s), compact `5:peers` parsed by a minimal
+   bencode reader, not a general one. UDP: BEP 15 connect + announce on a
+   blocking `QUdpSocket`, two attempts of 5 s, IPv4 only, no connection id
+   caching. `directAnnounceAllTrackers` dispatches by scheme and sends
+   `started` once per tracker, then no event; `directStopAllTrackers` sends
+   `stopped` at the end with short timeouts. Verified against three public
+   UDP trackers with a throwaway torrent on 2026-09-21.
 3. **IPinfo lookup.** `fetchIpInfoText` is the same blocking GET pattern,
    4 s timeout. Handles both legacy (`country`, `org`) and Lite
    (`country_code`, `asn{}` object) response shapes. `IpInfoLookupThread`
@@ -111,11 +118,13 @@ the binary) is gitignored. There are no tests, no CI, and no README.
   (min 200 ms). Tracker and DHT forced reannounces have a hard floor of 30 s.
   Output file is rewritten every 10 s and at the end. Preview tab refreshes
   every 3 s.
-- Every direct tracker announce sends `event=started` with a freshly random
-  `-QTPC01-` peer id and `left=<total size>`, so trackers see a new leecher on
-  each reannounce. Be mindful of this if you lower intervals.
-- The worker's poll cycle can still block on the direct HTTP tracker
-  announce, up to 15 s per tracker. IPinfo no longer blocks it. "Stop" takes
+- The direct announce presents itself as a leecher (`left=<total size>`) with
+  a `-QTPC01-` peer id that is fixed for the run. Trackers therefore list this
+  machine as a peer for the torrent while it runs, and drop it after
+  `stopped`.
+- The worker's poll cycle can still block on the direct tracker announce,
+  up to 15 s per HTTP tracker and 2 × 5 s per UDP tracker (plus a blocking
+  DNS lookup). IPinfo no longer blocks it. "Stop" takes
   effect between cycles; a normal end of run waits for the IPinfo queue to
   drain, a user Stop abandons it and writes `ipinfo=pending`. `closeEvent`
   waits at most 3 s.

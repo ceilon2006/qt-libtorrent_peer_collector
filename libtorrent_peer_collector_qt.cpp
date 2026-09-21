@@ -59,6 +59,7 @@
 #include <QtWidgets/QVBoxLayout>
 #include <QtWidgets/QWidget>
 
+#include <QtCore/QDataStream>
 #include <QtCore/QDateTime>
 #include <QtCore/QDir>
 #include <QtCore/QElapsedTimer>
@@ -87,6 +88,9 @@
 #include <QtNetwork/QNetworkAccessManager>
 #include <QtNetwork/QNetworkReply>
 #include <QtNetwork/QNetworkRequest>
+#include <QtNetwork/QHostAddress>
+#include <QtNetwork/QHostInfo>
+#include <QtNetwork/QUdpSocket>
 
 #include <QtCore/QEventLoop>
 #include <QtCore/QRandomGenerator>
@@ -448,7 +452,8 @@ static QString buildPeerSummaryText(const std::set<QString> &peers,
                                     const std::map<QString, std::set<QString>> &peer_sources)
 {
 	int connected = countPeersWithSource(peer_sources, "connected/get_peer_info");
-	int tracker_direct = countPeersWithSource(peer_sources, "tracker-direct-http");
+	int tracker_direct_http = countPeersWithSource(peer_sources, "tracker-direct-http");
+	int tracker_direct_udp = countPeersWithSource(peer_sources, "tracker-direct-udp");
 	int connect_in = countPeersWithSource(peer_sources, "peer-connect-in");
 	int connect_out = countPeersWithSource(peer_sources, "peer-connect-out");
 	int connect_failed = countPeersWithSource(peer_sources, "peer-connect-failed");
@@ -466,17 +471,19 @@ static QString buildPeerSummaryText(const std::set<QString> &peers,
 	    "  Total unique peers       : %1\n"
 	    "  Connected/get_peer_info  : %2\n"
 	    "  Direct HTTP tracker      : %3\n"
-	    "  Connected in / out       : %4 / %5\n"
-	    "  Connect failed           : %6\n"
-	    "  Disconnected             : %7\n"
-	    "  Incoming (pre-handshake) : %8\n"
-	    "  Error/banned/blocked     : %9\n"
-	    "  Other peer alert         : %10\n"
-	    "  Any peer alert source    : %11\n"
-	    "  Unknown/no source tag    : %12\n")
+	    "  Direct UDP tracker       : %4\n"
+	    "  Connected in / out       : %5 / %6\n"
+	    "  Connect failed           : %7\n"
+	    "  Disconnected             : %8\n"
+	    "  Incoming (pre-handshake) : %9\n"
+	    "  Error/banned/blocked     : %10\n"
+	    "  Other peer alert         : %11\n"
+	    "  Any peer alert source    : %12\n"
+	    "  Unknown/no source tag    : %13\n")
 	    .arg(peers.size())
 	    .arg(connected)
-	    .arg(tracker_direct)
+	    .arg(tracker_direct_http)
+	    .arg(tracker_direct_udp)
 	    .arg(connect_in)
 	    .arg(connect_out)
 	    .arg(connect_failed)
@@ -699,20 +706,61 @@ static QStringList parseTrackerResponsePeers(const QByteArray &data)
 	return peers;
 }
 
+/*
+ * State for the direct announces of one run.
+ *
+ * A tracker expects one peer id for the lifetime of a "peer", event=started
+ * once, plain announces after that, and event=stopped at the end. The first
+ * version of this tool sent started with a fresh random id every interval,
+ * which trackers count as a new leecher each time.
+ */
+struct DirectAnnounceContext {
+	QByteArray peer_id;
+	quint32 key = 0;
+	std::set<QString> started;    /* trackers that were sent event=started */
+};
+
+/* BEP 3 event names as sent to HTTP trackers; BEP 15 numeric codes for UDP. */
+enum DirectAnnounceEvent {
+	ANNOUNCE_EVENT_NONE = 0,
+	ANNOUNCE_EVENT_COMPLETED = 1,
+	ANNOUNCE_EVENT_STARTED = 2,
+	ANNOUNCE_EVENT_STOPPED = 3
+};
+
+static const char *announceEventName(DirectAnnounceEvent event)
+{
+	switch (event) {
+	case ANNOUNCE_EVENT_STARTED:
+		return "started";
+	case ANNOUNCE_EVENT_STOPPED:
+		return "stopped";
+	case ANNOUNCE_EVENT_COMPLETED:
+		return "completed";
+	default:
+		return "";
+	}
+}
+
+static qint64 torrentLeftBytes(const lt::torrent_info &ti)
+{
+	try {
+		return (qint64)ti.total_size();
+	} catch (...) {
+		return 0;
+	}
+}
+
 static QByteArray buildTrackerAnnounceUrl(const QString &tracker_url,
                                           const lt::torrent_info &ti,
                                           int listen_port,
-                                          const QByteArray &peer_id)
+                                          const QByteArray &peer_id,
+                                          quint32 key,
+                                          DirectAnnounceEvent event)
 {
 	QByteArray url = tracker_url.toUtf8();
 	QByteArray info_hash_bytes = sha1HashToBytes(ti.info_hash());
-	qint64 left = 0;
-
-	try {
-		left = (qint64)ti.total_size();
-	} catch (...) {
-		left = 0;
-	}
+	const char *event_name = announceEventName(event);
 
 	url += (url.contains('?') ? '&' : '?');
 	url += "info_hash=" + urlEncodeBytes(info_hash_bytes);
@@ -720,10 +768,15 @@ static QByteArray buildTrackerAnnounceUrl(const QString &tracker_url,
 	url += "&port=" + QByteArray::number(listen_port);
 	url += "&uploaded=0";
 	url += "&downloaded=0";
-	url += "&left=" + QByteArray::number(left);
+	url += "&left=" + QByteArray::number(torrentLeftBytes(ti));
 	url += "&compact=1";
-	url += "&numwant=200";
-	url += "&event=started";
+	url += "&numwant=" + QByteArray::number(event == ANNOUNCE_EVENT_STOPPED ? 0 : 200);
+	url += "&key=" + QByteArray::number(key, 16);
+
+	if (event_name[0] != '\0') {
+		url += "&event=";
+		url += event_name;
+	}
 
 	return url;
 }
@@ -731,20 +784,13 @@ static QByteArray buildTrackerAnnounceUrl(const QString &tracker_url,
 static QStringList directHttpTrackerAnnounce(const QString &tracker_url,
                                              const lt::torrent_info &ti,
                                              int listen_port,
+                                             const DirectAnnounceContext &ctx,
+                                             DirectAnnounceEvent event,
+                                             int timeout_ms,
                                              QStringList *log_lines)
 {
 	QStringList peers;
-	QUrl parsed(tracker_url);
-
-	if (parsed.scheme() != "http" && parsed.scheme() != "https") {
-		if (log_lines != nullptr) {
-			*log_lines << "Direct tracker announce skipped non-HTTP tracker: " + tracker_url;
-		}
-		return peers;
-	}
-
-	QByteArray peer_id = makePeerId();
-	QByteArray full_url = buildTrackerAnnounceUrl(tracker_url, ti, listen_port, peer_id);
+	QByteArray full_url = buildTrackerAnnounceUrl(tracker_url, ti, listen_port, ctx.peer_id, ctx.key, event);
 
 	QNetworkAccessManager manager;
 	QNetworkRequest request(QUrl::fromEncoded(full_url));
@@ -757,7 +803,7 @@ static QStringList directHttpTrackerAnnounce(const QString &tracker_url,
 	QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
 	QObject::connect(&timeout, &QTimer::timeout, &loop, &QEventLoop::quit);
 
-	timeout.start(15000);
+	timeout.start(timeout_ms);
 	loop.exec();
 
 	if (timeout.isActive()) {
@@ -793,7 +839,7 @@ static QStringList directHttpTrackerAnnounce(const QString &tracker_url,
 
 	peers = parseTrackerResponsePeers(data);
 
-	if (log_lines != nullptr) {
+	if (log_lines != nullptr && event != ANNOUNCE_EVENT_STOPPED) {
 		*log_lines << QString("Direct tracker announce: %1 -> %2 compact IPv4 peers")
 		                  .arg(tracker_url)
 		                  .arg(peers.size());
@@ -802,11 +848,209 @@ static QStringList directHttpTrackerAnnounce(const QString &tracker_url,
 	return peers;
 }
 
-static int directAnnounceAllHttpTrackers(const std::shared_ptr<lt::torrent_info> &ti,
-                                         int listen_port,
-                                         std::set<QString> &peers,
-                                         std::map<QString, std::set<QString>> &peer_sources,
-                                         QStringList *log_lines)
+/* ------------------------------------------------------------------------- */
+/* Direct UDP tracker announce (BEP 15)                                       */
+/* ------------------------------------------------------------------------- */
+
+static quint32 readBigEndian32(const QByteArray &data, int offset)
+{
+	return ((quint32)(unsigned char)data[offset] << 24) |
+	       ((quint32)(unsigned char)data[offset + 1] << 16) |
+	       ((quint32)(unsigned char)data[offset + 2] << 8) |
+	       ((quint32)(unsigned char)data[offset + 3]);
+}
+
+/*
+ * Send one request and wait for the reply that carries our transaction id.
+ * BEP 15 suggests retrying with 15 * 2^n second timeouts; two attempts of
+ * timeout_ms each keep the collector's poll cycle bounded instead.
+ * Returns the datagram, or empty on timeout.
+ */
+static QByteArray udpTrackerExchange(QUdpSocket &sock,
+                                     const QHostAddress &addr,
+                                     quint16 port,
+                                     const QByteArray &request,
+                                     quint32 transaction_id,
+                                     int timeout_ms)
+{
+	for (int attempt = 0; attempt < 2; attempt++) {
+		QElapsedTimer t;
+
+		if (sock.writeDatagram(request, addr, port) != request.size()) {
+			return QByteArray();
+		}
+
+		t.start();
+
+		while (t.elapsed() < timeout_ms) {
+			int remaining = timeout_ms - (int)t.elapsed();
+
+			if (!sock.waitForReadyRead(remaining)) {
+				break;
+			}
+
+			while (sock.hasPendingDatagrams()) {
+				QByteArray d;
+
+				d.resize((int)sock.pendingDatagramSize());
+				sock.readDatagram(d.data(), d.size());
+
+				if (d.size() >= 8 && readBigEndian32(d, 4) == transaction_id) {
+					return d;
+				}
+			}
+		}
+	}
+
+	return QByteArray();
+}
+
+static QStringList directUdpTrackerAnnounce(const QString &tracker_url,
+                                            const lt::torrent_info &ti,
+                                            int listen_port,
+                                            const DirectAnnounceContext &ctx,
+                                            DirectAnnounceEvent event,
+                                            int timeout_ms,
+                                            QStringList *log_lines)
+{
+	QStringList peers;
+	QUrl parsed(tracker_url);
+	QString host = parsed.host();
+	int port = parsed.port(-1);
+	QHostAddress addr;
+	QUdpSocket sock;
+	QByteArray request;
+	QByteArray reply;
+	quint32 tid;
+	quint64 connection_id;
+	quint32 action;
+
+	if (host.isEmpty() || port <= 0 || port > 65535) {
+		if (log_lines != nullptr) {
+			*log_lines << "Direct UDP announce: bad tracker URL: " + tracker_url;
+		}
+		return peers;
+	}
+
+	/* Blocking name lookup. This runs in the worker thread. */
+	QHostInfo info = QHostInfo::fromName(host);
+
+	for (const QHostAddress &a : info.addresses()) {
+		if (a.protocol() == QAbstractSocket::IPv4Protocol) {
+			addr = a;
+			break;
+		}
+	}
+
+	if (addr.isNull()) {
+		if (log_lines != nullptr) {
+			*log_lines << "Direct UDP announce: could not resolve " + host + " (" + info.errorString() + ")";
+		}
+		return peers;
+	}
+
+	if (!sock.bind(QHostAddress::AnyIPv4, 0)) {
+		if (log_lines != nullptr) {
+			*log_lines << "Direct UDP announce: bind failed: " + sock.errorString();
+		}
+		return peers;
+	}
+
+	/* ---- connect: protocol id, action 0, transaction id ---- */
+	tid = QRandomGenerator::global()->generate();
+	{
+		QDataStream ds(&request, QIODevice::WriteOnly);
+		ds.setByteOrder(QDataStream::BigEndian);
+		ds << (quint64)0x41727101980ULL << (quint32)0 << tid;
+	}
+
+	reply = udpTrackerExchange(sock, addr, (quint16)port, request, tid, timeout_ms);
+
+	if (reply.size() < 16 || readBigEndian32(reply, 0) != 0) {
+		if (log_lines != nullptr) {
+			*log_lines << "Direct UDP announce: no connect reply from " + tracker_url;
+		}
+		return peers;
+	}
+
+	connection_id = ((quint64)readBigEndian32(reply, 8) << 32) | readBigEndian32(reply, 12);
+
+	/* ---- announce: 98 bytes ---- */
+	tid = QRandomGenerator::global()->generate();
+	request.clear();
+	{
+		QByteArray info_hash_bytes = sha1HashToBytes(ti.info_hash());
+		QByteArray peer_id = ctx.peer_id;
+		QDataStream ds(&request, QIODevice::WriteOnly);
+
+		peer_id.resize(20);
+		ds.setByteOrder(QDataStream::BigEndian);
+		ds << connection_id << (quint32)1 << tid;
+		ds.writeRawData(info_hash_bytes.constData(), 20);
+		ds.writeRawData(peer_id.constData(), 20);
+		ds << (quint64)0                          /* downloaded */
+		   << (quint64)torrentLeftBytes(ti)       /* left */
+		   << (quint64)0                          /* uploaded */
+		   << (quint32)event
+		   << (quint32)0                          /* IP: default */
+		   << ctx.key
+		   << (qint32)(event == ANNOUNCE_EVENT_STOPPED ? 0 : 200)
+		   << (quint16)listen_port;
+	}
+
+	reply = udpTrackerExchange(sock, addr, (quint16)port, request, tid, timeout_ms);
+
+	if (reply.size() < 8) {
+		if (log_lines != nullptr) {
+			*log_lines << "Direct UDP announce timeout: " + tracker_url;
+		}
+		return peers;
+	}
+
+	action = readBigEndian32(reply, 0);
+
+	if (action == 3) {
+		if (log_lines != nullptr) {
+			*log_lines << "Tracker failure: " + tracker_url + " : " + QString::fromUtf8(reply.mid(8));
+		}
+		return peers;
+	}
+
+	if (action != 1 || reply.size() < 20) {
+		if (log_lines != nullptr) {
+			*log_lines << "Direct UDP announce: unexpected reply from " + tracker_url;
+		}
+		return peers;
+	}
+
+	peers = parseCompactIpv4Peers(reply.mid(20));
+
+	if (log_lines != nullptr && event != ANNOUNCE_EVENT_STOPPED) {
+		*log_lines << QString("Direct UDP announce: %1 -> %2 compact IPv4 peers (seeders %3, leechers %4)")
+		                  .arg(tracker_url)
+		                  .arg(peers.size())
+		                  .arg(readBigEndian32(reply, 16))
+		                  .arg(readBigEndian32(reply, 12));
+	}
+
+	return peers;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Direct announce driver                                                     */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * Announce to every tracker in the torrent that speaks HTTP, HTTPS or UDP.
+ * The first announce to a tracker sends event=started; later ones send no
+ * event. Returns how many peers were new to the set.
+ */
+static int directAnnounceAllTrackers(const std::shared_ptr<lt::torrent_info> &ti,
+                                     int listen_port,
+                                     DirectAnnounceContext &ctx,
+                                     std::set<QString> &peers,
+                                     std::map<QString, std::set<QString>> &peer_sources,
+                                     QStringList *log_lines)
 {
 	int added = 0;
 
@@ -818,21 +1062,74 @@ static int directAnnounceAllHttpTrackers(const std::shared_ptr<lt::torrent_info>
 
 	for (const lt::announce_entry &ae : trackers) {
 		QString tracker_url = QString::fromStdString(ae.url);
-		QStringList found = directHttpTrackerAnnounce(tracker_url, *ti, listen_port, log_lines);
+		QString scheme = QUrl(tracker_url).scheme().toLower();
+		DirectAnnounceEvent event;
+		QStringList found;
+		const char *tag;
+
+		event = (ctx.started.find(tracker_url) == ctx.started.end())
+		            ? ANNOUNCE_EVENT_STARTED
+		            : ANNOUNCE_EVENT_NONE;
+
+		if (scheme == "http" || scheme == "https") {
+			found = directHttpTrackerAnnounce(tracker_url, *ti, listen_port, ctx, event, 15000, log_lines);
+			tag = "tracker-direct-http";
+		} else if (scheme == "udp") {
+			found = directUdpTrackerAnnounce(tracker_url, *ti, listen_port, ctx, event, 5000, log_lines);
+			tag = "tracker-direct-udp";
+		} else {
+			if (log_lines != nullptr) {
+				*log_lines << "Direct tracker announce skipped unsupported scheme: " + tracker_url;
+			}
+			continue;
+		}
+
+		/*
+		 * Whether or not peers came back, the tracker has now heard "started"
+		 * from this peer id, so the next announce must not repeat it.
+		 */
+		ctx.started.insert(tracker_url);
 
 		for (const QString &p : found) {
 			if (peers.insert(p).second) {
 				added++;
 			}
 
-			peer_sources[p].insert("tracker-direct-http");
+			peer_sources[p].insert(tag);
 		}
 	}
 
 	return added;
 }
 
+/*
+ * Tell every tracker that got a "started" that this peer is gone. Best
+ * effort with short timeouts: the run is ending and nothing depends on the
+ * replies.
+ */
+static void directStopAllTrackers(const std::shared_ptr<lt::torrent_info> &ti,
+                                  int listen_port,
+                                  const DirectAnnounceContext &ctx,
+                                  QStringList *log_lines)
+{
+	if (!ti || ctx.started.empty()) {
+		return;
+	}
 
+	for (const QString &tracker_url : ctx.started) {
+		QString scheme = QUrl(tracker_url).scheme().toLower();
+
+		if (scheme == "http" || scheme == "https") {
+			directHttpTrackerAnnounce(tracker_url, *ti, listen_port, ctx, ANNOUNCE_EVENT_STOPPED, 5000, log_lines);
+		} else if (scheme == "udp") {
+			directUdpTrackerAnnounce(tracker_url, *ti, listen_port, ctx, ANNOUNCE_EVENT_STOPPED, 3000, log_lines);
+		}
+	}
+
+	if (log_lines != nullptr) {
+		*log_lines << QString("Sent event=stopped to %1 tracker(s).").arg(ctx.started.size());
+	}
+}
 
 /* ------------------------------------------------------------------------- */
 /* IPinfo lookup helpers                                                      */
@@ -1509,8 +1806,12 @@ protected:
 			if (includeIpInfoComments) {
 				emit logMessage("IPinfo lookups run in the background and are cached. Same IP is looked up only once.");
 			}
-			emit logMessage("UDP trackers are not directly decoded in this build yet.");
+			emit logMessage("Direct announces go to HTTP, HTTPS and UDP (BEP 15) trackers with one peer id per run.");
 			emit logMessage("");
+
+			DirectAnnounceContext announceCtx;
+			announceCtx.peer_id = makePeerId();
+			announceCtx.key = QRandomGenerator::global()->generate();
 
 			std::unique_ptr<IpInfoLookupThread> ipInfoLookup;
 
@@ -1566,9 +1867,10 @@ protected:
 					}
 
 					QStringList direct_logs;
-					int added_direct = directAnnounceAllHttpTrackers(
+					int added_direct = directAnnounceAllTrackers(
 					    ti,
 					    listenPort,
+					    announceCtx,
 					    peers,
 					    peerSources,
 					    &direct_logs);
@@ -1578,7 +1880,7 @@ protected:
 					}
 
 					if (added_direct > 0) {
-						emit logMessage("Direct HTTP tracker added peers: " + QString::number(added_direct));
+						emit logMessage("Direct tracker announce added peers: " + QString::number(added_direct));
 					}
 
 					last_tracker_reannounce_ms = timer.elapsed();
@@ -1683,6 +1985,16 @@ protected:
 
 			if (stopRequested.load()) {
 				emit logMessage("Stop requested by user.");
+			}
+
+			if (enableTrackers) {
+				QStringList stop_logs;
+
+				directStopAllTrackers(ti, listenPort, announceCtx, &stop_logs);
+
+				for (const QString &line : stop_logs) {
+					emit logMessage(line);
+				}
 			}
 
 			if (ipInfoLookup) {
@@ -1980,7 +2292,7 @@ private:
 		lsdCheck = new QCheckBox("LSD / Local peer discovery", group);
 		lsdCheck->setChecked(true);
 
-		sourceCommentsCheck = new QCheckBox("Print peer source in comments: tracker-direct-http, connected/get_peer_info, etc.", group);
+		sourceCommentsCheck = new QCheckBox("Print peer source in comments: tracker-direct-http, tracker-direct-udp, peer-connect-out, etc.", group);
 		sourceCommentsCheck->setChecked(true);
 
 		ipInfoCommentsCheck = new QCheckBox("Print IPinfo-style country/provider info in comments", group);
@@ -2152,8 +2464,11 @@ private:
 		    "<tr><td><b>Peer poll interval</b></td><td>How often connected peers "
 		    "and libtorrent alerts are read. Minimum 0.2 seconds.</td></tr>"
 		    "<tr><td><b>Tracker reannounce interval</b></td><td>How often trackers "
-		    "are asked again, both through libtorrent and by the direct HTTP "
-		    "announce. Floor of 30 seconds: trackers rate-limit announces.</td></tr>"
+		    "are asked again, both through libtorrent and by this application's "
+		    "own direct announce to every HTTP, HTTPS and UDP tracker. The direct "
+		    "announce uses one peer id for the whole run, sends <i>started</i> "
+		    "once per tracker and <i>stopped</i> when the run ends. Floor of 30 "
+		    "seconds: trackers rate-limit announces.</td></tr>"
 		    "<tr><td><b>DHT reannounce interval</b></td><td>How often a DHT "
 		    "announce is forced. Same 30 second floor.</td></tr>"
 		    "</table>"
@@ -2199,7 +2514,9 @@ private:
 		    "connected peer list at the moment of a poll.</td></tr>"
 		    "<tr><td><tt>tracker-direct-http</tt></td><td>Returned by an HTTP or "
 		    "HTTPS tracker to this application's own announce, made alongside "
-		    "libtorrent's. UDP trackers are not queried this way.</td></tr>"
+		    "libtorrent's.</td></tr>"
+		    "<tr><td><tt>tracker-direct-udp</tt></td><td>Same, from a UDP tracker "
+		    "(BEP 15).</td></tr>"
 		    "<tr><td><tt>peer-connect-out</tt></td><td>libtorrent connected to the "
 		    "peer and completed the handshake.</td></tr>"
 		    "<tr><td><tt>peer-connect-in</tt></td><td>The peer connected to us and "
