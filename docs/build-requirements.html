@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Build Requirements</title>
+<meta name="description" content="Which Qt and libtorrent components libtorrent_peer_collector_qt needs, how to check for them, and how to install what is missing.">
+<style>
+:root {
+  --ground: #f2f4f6;
+  --surface: #ffffff;
+  --surface-2: #e9edf1;
+  --ink: #16191d;
+  --ink-2: #545c66;
+  --ink-3: #7b848f;
+  --rule: #d5dae0;
+  --rule-soft: #e3e8ed;
+  --amber: #a8700f;
+  --amber-bg: #fbf0d8;
+  --amber-edge: #e6a01e;
+  --green: #2f7d4f;
+  --green-bg: #e0f0e6;
+  --green-edge: #2f7d4f;
+  --blue: #2a5c8f;
+  --blue-bg: #e2ebf5;
+  --blue-edge: #4a7fb5;
+  --red: #b02a26;
+  --red-bg: #fbe4e2;
+  --red-edge: #c8322d;
+
+  --measure: 72ch;
+  --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "Cascadia Mono", Consolas, "DejaVu Sans Mono", monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ground: #14171a;
+    --surface: #1c2024;
+    --surface-2: #23282d;
+    --ink: #e7eaee;
+    --ink-2: #a4adb8;
+    --ink-3: #7d8791;
+    --rule: #333a41;
+    --rule-soft: #272d33;
+    --amber: #e6b053;
+    --amber-bg: #33280f;
+    --green: #6cc08b;
+    --green-bg: #16301f;
+    --green-edge: #3d9a63;
+    --blue: #85b3e0;
+    --blue-bg: #182634;
+    --blue-edge: #4a7fb5;
+    --red: #f08079;
+    --red-bg: #3a1d1b;
+  }
+}
+:root[data-theme="dark"] {
+  --ground: #14171a;
+  --surface: #1c2024;
+  --surface-2: #23282d;
+  --ink: #e7eaee;
+  --ink-2: #a4adb8;
+  --ink-3: #7d8791;
+  --rule: #333a41;
+  --rule-soft: #272d33;
+  --amber: #e6b053;
+  --amber-bg: #33280f;
+  --green: #6cc08b;
+  --green-bg: #16301f;
+  --green-edge: #3d9a63;
+  --blue: #85b3e0;
+  --blue-bg: #182634;
+  --blue-edge: #4a7fb5;
+  --red: #f08079;
+  --red-bg: #3a1d1b;
+}
+
+* { box-sizing: border-box; }
+html { background: var(--ground); }
+body {
+  margin: 0;
+  padding: 2rem 16px 4rem;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 1rem;
+  line-height: 1.55;
+}
+main {
+  max-width: var(--measure);
+  margin: 0 auto;
+}
+h1 {
+  font-size: 2rem;
+  line-height: 1.15;
+  margin: 0 0 .25rem;
+  letter-spacing: -.01em;
+}
+.subtitle {
+  color: var(--ink-2);
+  margin: 0 0 2rem;
+}
+h2 {
+  font-size: 1.35rem;
+  margin: 2.5rem 0 .75rem;
+  padding-bottom: .3rem;
+  border-bottom: 1px solid var(--rule);
+}
+h3 {
+  font-size: 1.05rem;
+  margin: 1.5rem 0 .5rem;
+}
+p { margin: 0 0 .9rem; }
+ul, ol { margin: 0 0 .9rem; padding-left: 1.4rem; }
+li { margin: .2rem 0; }
+code, pre {
+  font-family: var(--mono);
+  font-size: .92em;
+}
+code {
+  background: var(--surface-2);
+  padding: .08em .35em;
+  border-radius: 3px;
+}
+pre {
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  padding: .75rem 1rem;
+  overflow-x: auto;
+  margin: 0 0 1rem;
+  line-height: 1.45;
+}
+pre code { background: none; padding: 0; }
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0 0 1.25rem;
+  font-size: .95rem;
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  overflow: hidden;
+}
+th, td {
+  text-align: left;
+  vertical-align: top;
+  padding: .5rem .7rem;
+  border-bottom: 1px solid var(--rule-soft);
+}
+th {
+  background: var(--surface-2);
+  color: var(--ink-2);
+  font-weight: 600;
+  font-size: .85rem;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+tr:last-child td { border-bottom: none; }
+.table-wrap { overflow-x: auto; margin: 0 0 1.25rem; }
+.table-wrap table { margin: 0; min-width: 40rem; }
+
+.note {
+  border-left: 4px solid var(--blue-edge);
+  background: var(--blue-bg);
+  padding: .6rem .9rem;
+  border-radius: 0 6px 6px 0;
+  margin: 0 0 1rem;
+}
+.warn {
+  border-left: 4px solid var(--amber-edge);
+  background: var(--amber-bg);
+  padding: .6rem .9rem;
+  border-radius: 0 6px 6px 0;
+  margin: 0 0 1rem;
+}
+.ok {
+  border-left: 4px solid var(--green-edge);
+  background: var(--green-bg);
+  padding: .6rem .9rem;
+  border-radius: 0 6px 6px 0;
+  margin: 0 0 1rem;
+}
+.note p:last-child, .warn p:last-child, .ok p:last-child { margin-bottom: 0; }
+.err { color: var(--red); font-family: var(--mono); font-size: .9em; }
+.muted { color: var(--ink-3); }
+footer {
+  margin-top: 3rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--rule);
+  color: var(--ink-3);
+  font-size: .85rem;
+}
+</style>
+</head>
+<body>
+<main>
+
+<h1>Build Requirements</h1>
+<p class="subtitle">What <code>libtorrent_peer_collector_qt</code> needs to compile and run, how to tell what is missing, and how to install it.</p>
+
+<div class="ok">
+<p>Verified on Ubuntu 26.04.1 LTS with Qt 6.10.2, libtorrent-rasterbar 2.0.12 and GCC, on 2026-09-20. The package names below are the ones that machine actually resolved.</p>
+</div>
+
+<h2 id="what">What the project uses</h2>
+
+<p>The project is one C++17 source file built with qmake. Its <code>.pro</code> file declares everything it links:</p>
+
+<pre><code>QT += widgets core gui network
+CONFIG += c++17 console link_pkgconfig
+PKGCONFIG += libtorrent-rasterbar</code></pre>
+
+<p>So the build needs four Qt modules, the Qt build tools, a C++ toolchain, <code>pkg-config</code>, and the libtorrent development files. libtorrent in turn needs Boost headers and OpenSSL headers.</p>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>Component</th><th>Why</th><th>Debian / Ubuntu</th><th>Fedora</th><th>Arch</th></tr>
+</thead>
+<tbody>
+<tr>
+  <td>C++17 compiler, make</td>
+  <td>Compiles and links the program.</td>
+  <td><code>build-essential</code></td>
+  <td><code>gcc-c++</code> <code>make</code></td>
+  <td><code>base-devel</code></td>
+</tr>
+<tr>
+  <td>qmake6</td>
+  <td>Reads the <code>.pro</code> file and writes the Makefile.</td>
+  <td><code>qmake6-bin</code> <span class="muted">(pulled in by qt6-base-dev)</span></td>
+  <td><code>qt6-qtbase-devel</code></td>
+  <td><code>qt6-base</code></td>
+</tr>
+<tr>
+  <td>Qt 6 headers: Core, Gui, Widgets, Network</td>
+  <td>Main window, dialogs, settings, the HTTP client for trackers and IPinfo.</td>
+  <td><code>qt6-base-dev</code></td>
+  <td><code>qt6-qtbase-devel</code></td>
+  <td><code>qt6-base</code></td>
+</tr>
+<tr>
+  <td>moc</td>
+  <td>Generates the signal/slot code for the two <code>Q_OBJECT</code> classes.</td>
+  <td><code>qt6-base-dev-tools</code> <span class="muted">(pulled in by qt6-base-dev)</span></td>
+  <td><code>qt6-qtbase-devel</code></td>
+  <td><code>qt6-base</code></td>
+</tr>
+<tr>
+  <td>pkg-config</td>
+  <td>Tells qmake where libtorrent's headers and library are.</td>
+  <td><code>pkgconf</code> <span class="muted">(pulled in by libtorrent-rasterbar-dev)</span></td>
+  <td><code>pkgconf-pkg-config</code></td>
+  <td><code>pkgconf</code></td>
+</tr>
+<tr>
+  <td>libtorrent-rasterbar 2.0 headers and library</td>
+  <td>The BitTorrent session, DHT, PEX, trackers, alerts.</td>
+  <td><code>libtorrent-rasterbar-dev</code></td>
+  <td><code>rb_libtorrent-devel</code></td>
+  <td><code>libtorrent-rasterbar</code></td>
+</tr>
+<tr>
+  <td>Boost headers, OpenSSL headers</td>
+  <td>libtorrent's public headers include them.</td>
+  <td><code>libboost-dev</code> <code>libssl-dev</code> <span class="muted">(pulled in by libtorrent-rasterbar-dev)</span></td>
+  <td><code>boost-devel</code> <code>openssl-devel</code></td>
+  <td><code>boost</code> <code>openssl</code></td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<h3>Runtime only</h3>
+
+<p>A machine that only runs the built executable does not need the <code>-dev</code> packages. It needs the shared libraries the binary links, and a Qt platform plugin for the display server:</p>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>Library</th><th>Debian / Ubuntu</th><th>Fedora</th><th>Arch</th></tr>
+</thead>
+<tbody>
+<tr><td>libQt6Core, libQt6Gui, libQt6Widgets, libQt6Network</td><td><code>libqt6widgets6</code> <code>libqt6network6</code></td><td><code>qt6-qtbase</code> <code>qt6-qtbase-gui</code></td><td><code>qt6-base</code></td></tr>
+<tr><td>Qt platform plugin (X11 or Wayland)</td><td><code>qt6-qpa-plugins</code> <code>qt6-wayland</code></td><td><code>qt6-qtbase-gui</code> <code>qt6-qtwayland</code></td><td><code>qt6-base</code> <code>qt6-wayland</code></td></tr>
+<tr><td>libtorrent-rasterbar.so.2.0</td><td><code>libtorrent-rasterbar2.0t64</code> <span class="muted">(libtorrent-rasterbar2.0 on releases before 24.04)</span></td><td><code>rb_libtorrent</code></td><td><code>libtorrent-rasterbar</code></td></tr>
+<tr><td>libssl.so.3, libcrypto.so.3</td><td><code>libssl3t64</code></td><td><code>openssl-libs</code></td><td><code>openssl</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p><code>scripts/linux/deploy.sh</code> prints this list from the actual binary with <code>ldd</code>, so it always matches what was built.</p>
+
+<h2 id="check">How to check what is missing</h2>
+
+<p>Run these from any directory. Each one should print a version; a "not found" or an error names the missing piece.</p>
+
+<pre><code>g++ --version                                    # build-essential
+qmake6 -query QT_VERSION                         # qmake6-bin
+pkg-config --modversion Qt6Widgets Qt6Network    # qt6-base-dev
+ls /usr/lib/qt6/libexec/moc                      # qt6-base-dev-tools
+pkg-config --modversion libtorrent-rasterbar     # libtorrent-rasterbar-dev</code></pre>
+
+<p>Or just run the build script. It checks for qmake, make, pkg-config and libtorrent before it starts and prints an install hint for whichever is missing:</p>
+
+<pre><code>scripts/linux/build.sh</code></pre>
+
+<h3>Error messages and what they mean</h3>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>Message</th><th>Missing</th><th>Install</th></tr>
+</thead>
+<tbody>
+<tr><td><span class="err">qmake6: command not found</span></td><td>qmake</td><td><code>qt6-base-dev</code> (brings qmake6-bin)</td></tr>
+<tr><td><span class="err">Project ERROR: Unknown module(s) in QT: widgets network</span></td><td>Qt module headers</td><td><code>qt6-base-dev</code></td></tr>
+<tr><td><span class="err">Project ERROR: Cannot run compiler 'g++'</span></td><td>C++ compiler</td><td><code>build-essential</code></td></tr>
+<tr><td><span class="err">Project ERROR: libtorrent-rasterbar development package not found</span><br><span class="err">Package libtorrent-rasterbar was not found in the pkg-config search path</span></td><td>libtorrent dev files, or pkg-config itself</td><td><code>libtorrent-rasterbar-dev</code></td></tr>
+<tr><td><span class="err">fatal error: boost/asio.hpp: No such file or directory</span></td><td>Boost headers</td><td><code>libboost-dev</code></td></tr>
+<tr><td><span class="err">fatal error: openssl/ssl.h: No such file or directory</span></td><td>OpenSSL headers</td><td><code>libssl-dev</code></td></tr>
+<tr><td><span class="err">/usr/lib/qt6/libexec/moc: No such file</span> or an undefined reference to <code>vtable for MainWindow</code></td><td>moc</td><td><code>qt6-base-dev-tools</code></td></tr>
+<tr><td><span class="err">qt.qpa.plugin: Could not find the Qt platform plugin "xcb" / "wayland"</span> at run time</td><td>Qt platform plugin</td><td><code>qt6-qpa-plugins</code> or <code>qt6-wayland</code></td></tr>
+<tr><td><span class="err">error while loading shared libraries: libtorrent-rasterbar.so.2.0</span> at run time</td><td>libtorrent runtime</td><td><code>libtorrent-rasterbar2.0t64</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="install">Installing everything at once</h2>
+
+<h3>Debian / Ubuntu</h3>
+<pre><code>sudo apt update
+sudo apt install build-essential qt6-base-dev libtorrent-rasterbar-dev</code></pre>
+<p><code>qt6-base-dev</code> pulls in <code>qmake6-bin</code> and <code>qt6-base-dev-tools</code>. <code>libtorrent-rasterbar-dev</code> pulls in <code>pkgconf</code>, <code>libboost-dev</code> and <code>libssl-dev</code>. Nothing else is needed.</p>
+
+<h3>Fedora</h3>
+<pre><code>sudo dnf install gcc-c++ make pkgconf-pkg-config qt6-qtbase-devel rb_libtorrent-devel</code></pre>
+
+<h3>Arch</h3>
+<pre><code>sudo pacman -S --needed base-devel pkgconf qt6-base libtorrent-rasterbar</code></pre>
+
+<h3>Then build</h3>
+<pre><code>scripts/linux/build.sh            # release build into build/
+scripts/linux/build.sh debug      # debug build into build-debug/
+scripts/linux/rebuild.sh          # clean first, then build
+scripts/linux/clean.sh            # remove everything generated
+scripts/linux/deploy.sh           # copy the executable to deploy/
+scripts/linux/deploy.sh --install # install to ~/.local/bin with a menu entry</code></pre>
+
+<p>Or by hand:</p>
+<pre><code>qmake6 libtorrent_peer_collector_qt.pro
+make</code></pre>
+
+<h2 id="windows">Windows</h2>
+
+<p>The Qt side is the same as for any Qt Widgets program. The difference is libtorrent: the Qt Online Installer does not ship it, and the <code>.pro</code> file finds it through <code>pkg-config</code>, which the Qt installer does not ship either.</p>
+
+<h3>Recommended: everything from MSYS2</h3>
+
+<p>MSYS2 packages Qt 6, libtorrent, Boost, OpenSSL, pkg-config and the MinGW toolchain, all built with the same compiler, so they link together without surprises.</p>
+
+<ol>
+<li>Install MSYS2 from <code>msys2.org</code>.</li>
+<li>Open the <b>MSYS2 MINGW64</b> shell and install:</li>
+</ol>
+<pre><code>pacman -S --needed mingw-w64-x86_64-toolchain mingw-w64-x86_64-pkgconf \
+    mingw-w64-x86_64-qt6-base mingw-w64-x86_64-qt6-tools \
+    mingw-w64-x86_64-libtorrent-rasterbar</code></pre>
+<ol start="3">
+<li>Build from a normal Command Prompt with the MinGW64 bin folder on <code>PATH</code>, or straight from the MINGW64 shell:</li>
+</ol>
+<pre><code>set PATH=C:\msys64\mingw64\bin;%PATH%
+scripts\windows\build.bat
+scripts\windows\deploy.bat</code></pre>
+
+<div class="note">
+<p><code>deploy.bat</code> runs <code>windeployqt</code> for the Qt DLLs and then copies <code>libtorrent-rasterbar</code>, <code>libssl</code> and <code>libcrypto</code> from the folder <code>pkg-config --variable=prefix libtorrent-rasterbar</code> points at. If MSYS2 only installs <code>windeployqt6.exe</code>, set <code>QT_DEPLOY=C:\msys64\mingw64\bin\windeployqt6.exe</code> first.</p>
+</div>
+
+<h3>Alternative: Qt Online Installer plus your own libtorrent</h3>
+
+<p>Install these components in the Qt Maintenance Tool:</p>
+<ul>
+<li>Qt 6.x &rarr; <b>MinGW 64-bit</b> (the prebuilt Qt libraries and qmake6)</li>
+<li>Qt 6.x &rarr; Additional Libraries: nothing extra; Widgets and Network are part of the base module</li>
+<li>Developer and Designer Tools &rarr; <b>MinGW 13.x 64-bit</b> (the compiler and mingw32-make)</li>
+<li>Developer and Designer Tools &rarr; <b>Qt Creator</b> (optional)</li>
+</ul>
+
+<div class="warn">
+<p>libtorrent, Boost and OpenSSL must then come from somewhere else (vcpkg with the <code>x64-mingw-dynamic</code> triplet, or a source build) and must be compiled with a MinGW that is ABI-compatible with the one Qt ships. Mixing MSYS2's libtorrent with the Qt installer's Qt usually fails at link or start-up. That is why the all-MSYS2 route is recommended.</p>
+<p>Whichever route you take, <code>pkg-config.exe</code> must be on <code>PATH</code> and <code>PKG_CONFIG_PATH</code> must contain the folder with <code>libtorrent-rasterbar.pc</code>. <code>build.bat</code> checks both and stops with a message if either is missing.</p>
+</div>
+
+<h2 id="qtcreator">Qt Creator</h2>
+
+<p>Open <code>libtorrent_peer_collector_qt.pro</code> as a project. The kit must use a Qt 6 version and the same compiler the system libtorrent was built with, which on Linux is simply the distribution's GCC. Qt Creator runs qmake itself, so it needs <code>pkg-config</code> on its <code>PATH</code>; on Linux that is automatic once the packages above are installed.</p>
+
+<p>The <code>.qtcreator</code> folder is kept in git, the <code>build-*</code> folders Qt Creator creates are not.</p>
+
+<footer>
+<p>Part of <code>libtorrent_peer_collector_qt</code>. Companion to <code>AGENTS.md</code> and the scripts under <code>scripts/</code>.</p>
+</footer>
+
+</main>
+</body>
+</html>

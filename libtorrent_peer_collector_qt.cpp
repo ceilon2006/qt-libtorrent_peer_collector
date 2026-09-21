@@ -22,14 +22,18 @@
  *   - LSD/local discovery
  *   - connected peers
  *
- * Build with CMake:
- *   cp CMakeLists_libtorrent_peer_collector_qt.txt CMakeLists.txt
- *   cmake -S . -B build
- *   cmake --build build
+ * Build (out-of-tree, into build/):
+ *   scripts/linux/build.sh      [release|debug]
+ *   scripts\windows\build.bat   [release|debug]
  *
- * Build with qmake:
+ * rebuild.* cleans first, clean.* removes every generated file, deploy.*
+ * copies the executable (plus Qt/libtorrent DLLs on Windows) to deploy/.
+ *
+ * By hand:
  *   qmake6 libtorrent_peer_collector_qt.pro
  *   make
+ *
+ * Required packages: see docs/build-requirements.html.
  */
 
 #include <QtWidgets/QApplication>
@@ -63,6 +67,9 @@
 #include <QtCore/QIODevice>
 #include <QtCore/QUrlQuery>
 #include <QtCore/QJsonValue>
+#include <QtCore/QMutex>
+#include <QtCore/QMutexLocker>
+#include <QtCore/QWaitCondition>
 #include <QtCore/QPointer>
 #include <QtCore/QJsonObject>
 #include <QtCore/QJsonDocument>
@@ -91,8 +98,13 @@
 #include <libtorrent/alert_types.hpp>
 #include <libtorrent/download_priority.hpp>
 #include <libtorrent/error_code.hpp>
+#include <libtorrent/extensions.hpp>
+#include <libtorrent/extensions/smart_ban.hpp>
+#include <libtorrent/extensions/ut_metadata.hpp>
+#include <libtorrent/extensions/ut_pex.hpp>
 #include <libtorrent/peer_info.hpp>
 #include <libtorrent/session.hpp>
+#include <libtorrent/session_params.hpp>
 #include <libtorrent/settings_pack.hpp>
 #include <libtorrent/storage_defs.hpp>
 #include <libtorrent/torrent_handle.hpp>
@@ -102,6 +114,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <map>
 #include <set>
@@ -1016,53 +1029,146 @@ static QString fetchIpInfoText(const QString &ip,
 	return info;
 }
 
-static int ensureIpInfoForPeers(const std::set<QString> &peers,
-                                std::map<QString, QString> &ip_info_cache,
-                                const QString &token,
-                                int max_new_lookups,
-                                QStringList *log_lines)
-{
-	int lookups = 0;
-
-	if (max_new_lookups <= 0) {
-		return 0;
+/*
+ * Background IPinfo lookups.
+ *
+ * Each lookup is a blocking HTTP GET with a 4 second timeout. Doing them in
+ * the collector's poll loop stalled peer polling and made Stop wait for the
+ * whole batch. This thread owns a queue of IPs and a result cache. The
+ * collector enqueues new IPs every poll, takes a snapshot of the cache when
+ * it writes output, and drains the log lines. All state is behind one mutex.
+ *
+ * No signals: the collector forwards the log lines itself so every message
+ * to the GUI still comes from one place.
+ */
+class IpInfoLookupThread : public QThread {
+public:
+	explicit IpInfoLookupThread(const QString &token)
+	    : QThread(nullptr),
+	      token(token),
+	      stopRequested(false)
+	{
 	}
 
-	for (const QString &peer : peers) {
-		QString ip = peerIpOnly(peer);
+	~IpInfoLookupThread() override
+	{
+		requestStop();
+		wait();
+	}
 
-		if (ip.isEmpty()) {
-			continue;
-		}
+	/* Queue every IP from these peers that is neither cached nor already queued. */
+	void enqueuePeers(const std::set<QString> &peers)
+	{
+		QMutexLocker lock(&mutex);
+		bool added = false;
 
-		if (ip_info_cache.find(ip) != ip_info_cache.end()) {
-			continue;
-		}
+		for (const QString &peer : peers) {
+			QString ip = peerIpOnly(peer);
 
-		QString error;
-		QString info = fetchIpInfoText(ip, token, &error);
-
-		if (info.isEmpty()) {
-			info = "ipinfo=unavailable";
-			if (log_lines != nullptr) {
-				*log_lines << "IPinfo lookup failed for " + ip + ": " + error;
+			if (ip.isEmpty()) {
+				continue;
 			}
-		} else {
-			if (log_lines != nullptr) {
-				*log_lines << "IPinfo lookup: " + ip + " -> " + info;
+
+			if (cache.find(ip) != cache.end() || queued.find(ip) != queued.end()) {
+				continue;
 			}
+
+			queue.push_back(ip);
+			queued.insert(ip);
+			added = true;
 		}
 
-		ip_info_cache[ip] = info;
-		lookups++;
-
-		if (lookups >= max_new_lookups) {
-			break;
+		if (added) {
+			cond.wakeOne();
 		}
 	}
 
-	return lookups;
-}
+	std::map<QString, QString> snapshot() const
+	{
+		QMutexLocker lock(&mutex);
+
+		return cache;
+	}
+
+	/* Queued plus in flight. Zero means every enqueued IP is in the cache. */
+	int pendingCount() const
+	{
+		QMutexLocker lock(&mutex);
+
+		return (int)queued.size();
+	}
+
+	QStringList takeLogLines()
+	{
+		QMutexLocker lock(&mutex);
+		QStringList out = logLines;
+
+		logLines.clear();
+
+		return out;
+	}
+
+	void requestStop()
+	{
+		QMutexLocker lock(&mutex);
+
+		stopRequested = true;
+		cond.wakeAll();
+	}
+
+protected:
+	void run() override
+	{
+		while (true) {
+			QString ip;
+			QString error;
+			QString info;
+			QString line;
+
+			{
+				QMutexLocker lock(&mutex);
+
+				while (queue.empty() && !stopRequested) {
+					cond.wait(&mutex);
+				}
+
+				if (stopRequested) {
+					return;
+				}
+
+				ip = queue.front();
+				queue.pop_front();
+			}
+
+			info = fetchIpInfoText(ip, token, &error);
+
+			if (info.isEmpty()) {
+				info = "ipinfo=unavailable";
+				line = "IPinfo lookup failed for " + ip + ": " + error;
+			} else {
+				line = "IPinfo lookup: " + ip + " -> " + info;
+			}
+
+			{
+				QMutexLocker lock(&mutex);
+
+				cache[ip] = info;
+				queued.erase(ip);
+				logLines << line;
+			}
+		}
+	}
+
+private:
+	QString token;
+	mutable QMutex mutex;
+	QWaitCondition cond;
+	std::deque<QString> queue;
+	std::set<QString> queued;
+	std::map<QString, QString> cache;
+	QStringList logLines;
+	bool stopRequested;
+};
 
 
 /* ------------------------------------------------------------------------- */
@@ -1266,11 +1372,10 @@ protected:
 			emit logMessage("No download : " + QString(noDownload ? "true" : "false"));
 			emit logMessage("Trackers    : " + QString(enableTrackers ? "enabled" : "disabled"));
 			emit logMessage("DHT         : " + QString(enableDht ? "enabled" : "disabled"));
-			emit logMessage("PEX         : " + QString(enablePex ? "enabled/requested, requires connected peer" : "disabled/requested"));
+			emit logMessage("PEX         : " + QString(enablePex ? "enabled (ut_pex plugin), needs a connected peer" : "disabled (ut_pex plugin not loaded)"));
 			emit logMessage("LSD         : " + QString(enableLsd ? "enabled" : "disabled"));
 			emit logMessage("Source tags : " + QString(includeSourceComments ? "enabled" : "disabled"));
 			emit logMessage("IPinfo      : " + QString(includeIpInfoComments ? "enabled" : "disabled"));
-			emit logMessage("Note        : This libtorrent build may not support direct PEX on/off setting.");
 			emit logMessage("");
 
 			lt::settings_pack pack;
@@ -1304,15 +1409,6 @@ protected:
 			        lt::alert_category::dht |
 			        lt::alert_category::status));
 
-			/*
-			 * PEX compatibility note:
-			 * Some libtorrent versions/builds do not expose settings_pack::enable_pex.
-			 * In those builds PEX is controlled internally by libtorrent extensions and
-			 * cannot be toggled through settings_pack. The GUI checkbox is kept so the
-			 * selected mode is visible/logged, but this build may leave PEX at libtorrent's
-			 * default behavior.
-			 */
-
 			pack.set_str(
 			    lt::settings_pack::listen_interfaces,
 			    QString("0.0.0.0:%1").arg(listenPort).toStdString());
@@ -1327,7 +1423,14 @@ protected:
 			emit logMessage("libtorrent  : " + QString::fromLatin1(LIBTORRENT_VERSION));
 #endif
 
-			lt::session ses(pack);
+			/*
+			 * PEX is not a settings_pack key in libtorrent 2.0. It is the
+			 * ut_pex torrent plugin, added by default together with
+			 * ut_metadata and smart_ban. Build the session without the
+			 * default plugins and attach them per torrent, leaving ut_pex
+			 * out when the user unchecked PEX.
+			 */
+			lt::session ses(lt::session_params(pack), lt::session_flags_t{});
 
 			auto ti = std::make_shared<lt::torrent_info>(torrentPath.toStdString());
 
@@ -1335,6 +1438,12 @@ protected:
 			params.ti = ti;
 			params.save_path = tempDir.path().toStdString();
 			params.storage_mode = lt::storage_mode_t::storage_mode_sparse;
+			params.extensions.push_back(&lt::create_ut_metadata_plugin);
+			params.extensions.push_back(&lt::create_smart_ban_plugin);
+
+			if (enablePex) {
+				params.extensions.push_back(&lt::create_ut_pex_plugin);
+			}
 
 			lt::torrent_handle h = ses.add_torrent(params);
 
@@ -1387,35 +1496,28 @@ protected:
 				}
 			}
 
-			if (enableTrackers) {
-				QStringList direct_logs;
-				int added_direct = directAnnounceAllHttpTrackers(
-				    ti,
-				    listenPort,
-				    peers,
-				    peerSources,
-				    &direct_logs);
-
-				for (const QString &line : direct_logs) {
-					emit logMessage(line);
-				}
-
-				if (added_direct > 0) {
-					emit logMessage("Direct HTTP tracker added peers: " + QString::number(added_direct));
-					emit peerCountChanged((int)peers.size());
-					emit peersPreviewChanged(buildPeerOutputLines(peers, peerSources, ipInfoCache, includeSourceComments, includeIpInfoComments).join("\n") + (peers.empty() ? "" : "\n"));
-				}
-			}
+			/*
+			 * The direct HTTP tracker announce happens in the first poll
+			 * iteration below (first_poll), together with the forced
+			 * libtorrent reannounce. Not here as well.
+			 */
 
 			emit logMessage("Waiting for peers...");
 			emit logMessage("Peer list includes connected peers, IPv4:port endpoints found in libtorrent alerts,");
 			emit logMessage("and direct compact IPv4 peers returned by HTTP/HTTPS trackers.");
 			emit logMessage("Output comments auto-align: # column = longest IP:port length + 5 spaces.");
 			if (includeIpInfoComments) {
-				emit logMessage("IPinfo lookups are cached. Same IP is looked up only once.");
+				emit logMessage("IPinfo lookups run in the background and are cached. Same IP is looked up only once.");
 			}
 			emit logMessage("UDP trackers are not directly decoded in this build yet.");
 			emit logMessage("");
+
+			std::unique_ptr<IpInfoLookupThread> ipInfoLookup;
+
+			if (includeIpInfoComments) {
+				ipInfoLookup.reset(new IpInfoLookupThread(ipInfoToken));
+				ipInfoLookup->start();
+			}
 
 			QElapsedTimer timer;
 			timer.start();
@@ -1554,12 +1656,14 @@ protected:
 					emit peerCountChanged(last_count);
 				}
 
-				if (includeIpInfoComments && !peers.empty()) {
-					QStringList ipinfo_logs;
-					ensureIpInfoForPeers(peers, ipInfoCache, ipInfoToken, 10, &ipinfo_logs);
-					for (const QString &line : ipinfo_logs) {
+				if (ipInfoLookup) {
+					ipInfoLookup->enqueuePeers(peers);
+
+					for (const QString &line : ipInfoLookup->takeLogLines()) {
 						emit logMessage(line);
 					}
+
+					ipInfoCache = ipInfoLookup->snapshot();
 				}
 
 				if (first_poll || timer.elapsed() - last_save_ms >= 10000) {
@@ -1581,13 +1685,42 @@ protected:
 				emit logMessage("Stop requested by user.");
 			}
 
-			if (includeIpInfoComments && !peers.empty()) {
-				QStringList ipinfo_logs;
-				emit logMessage("Final IPinfo lookup for remaining peers...");
-				ensureIpInfoForPeers(peers, ipInfoCache, ipInfoToken, 1000000, &ipinfo_logs);
-				for (const QString &line : ipinfo_logs) {
+			if (ipInfoLookup) {
+				int pending;
+
+				ipInfoLookup->enqueuePeers(peers);
+				pending = ipInfoLookup->pendingCount();
+
+				/*
+				 * A normal end of run waits for the queue to drain so the
+				 * file is complete. A user Stop does not: the remaining
+				 * peers are written with ipinfo=pending.
+				 */
+				if (pending > 0 && !stopRequested.load()) {
+					emit logMessage("Waiting for " + QString::number(pending) + " remaining IPinfo lookups...");
+
+					while (!stopRequested.load() && ipInfoLookup->pendingCount() > 0) {
+						msleep(200);
+
+						for (const QString &line : ipInfoLookup->takeLogLines()) {
+							emit logMessage(line);
+						}
+					}
+				}
+
+				pending = ipInfoLookup->pendingCount();
+				if (pending > 0) {
+					emit logMessage("Stop requested: " + QString::number(pending) + " IPinfo lookups skipped.");
+				}
+
+				ipInfoLookup->requestStop();
+				ipInfoLookup->wait();
+
+				for (const QString &line : ipInfoLookup->takeLogLines()) {
 					emit logMessage(line);
 				}
+
+				ipInfoCache = ipInfoLookup->snapshot();
 			}
 
 			if (!savePeersToFile(outputPath, peers, peerSources, ipInfoCache, includeSourceComments, includeIpInfoComments, &save_error)) {
@@ -1828,8 +1961,9 @@ private:
 		dhtReannounceSpin->setSuffix(" sec");
 
 		listenPortSpin = new QSpinBox(group);
-		listenPortSpin->setRange(0, 65535);
+		listenPortSpin->setRange(1, 65535);
 		listenPortSpin->setValue(6881);
+		listenPortSpin->setToolTip("Ports below 1024 usually need root.");
 
 		noDownloadCheck = new QCheckBox("Try to avoid downloading payload pieces", group);
 		noDownloadCheck->setChecked(true);
@@ -1840,7 +1974,7 @@ private:
 		dhtCheck = new QCheckBox("DHT", group);
 		dhtCheck->setChecked(true);
 
-		pexCheck = new QCheckBox("PEX / Peer Exchange (if libtorrent build supports toggling)", group);
+		pexCheck = new QCheckBox("PEX / Peer Exchange (ut_pex plugin)", group);
 		pexCheck->setChecked(true);
 
 		lsdCheck = new QCheckBox("LSD / Local peer discovery", group);
@@ -2001,8 +2135,10 @@ private:
 		    "</ol>"
 		    "<h3>While it runs</h3>"
 		    "<p><b>Stop</b> asks the collector to finish its current poll cycle "
-		    "and then save. A cycle can take a while when a tracker or the IPinfo "
-		    "service is slow to answer, so Stop is not instant.</p>"
+		    "and then save. A cycle can take a while when an HTTP tracker is slow "
+		    "to answer, so Stop is not always instant. Pending IPinfo lookups are "
+		    "abandoned on Stop and the affected lines say "
+		    "<tt>ipinfo=pending</tt>.</p>"
 		    "<p>Torrent data is written to a temporary directory that is removed "
 		    "when the run ends. With <b>Try to avoid downloading payload pieces</b> "
 		    "checked, every file and piece is set to <i>do not download</i>, so "
@@ -2033,10 +2169,10 @@ private:
 		    "torrent. Unchecking clears the tracker list for this run.</td></tr>"
 		    "<tr><td><b>DHT</b></td><td>Enable the distributed hash table, "
 		    "bootstrapped from the usual public router nodes.</td></tr>"
-		    "<tr><td><b>PEX</b></td><td>Peer exchange. Only works after at least "
-		    "one peer is connected, so it needs Trackers, DHT or LSD. This "
-		    "libtorrent build does not expose a PEX switch; the box records the "
-		    "intent and is logged, but PEX stays at libtorrent's default.</td></tr>"
+		    "<tr><td><b>PEX</b></td><td>Peer exchange, the ut_pex plugin. "
+		    "Unchecking leaves the plugin out of the session, so no peer lists "
+		    "are swapped with connected peers. PEX only works after at least one "
+		    "peer is connected, so it needs Trackers, DHT or LSD.</td></tr>"
 		    "<tr><td><b>LSD</b></td><td>Local service discovery on the LAN.</td></tr>"
 		    "</table>"
 		    "<h3>Comments</h3>"
@@ -2045,7 +2181,9 @@ private:
 		    "each peer as a <tt>#</tt> comment. See the Peer Sources page.</td></tr>"
 		    "<tr><td><b>Print IPinfo</b></td><td>Look up country, city, provider "
 		    "and hostname for each IP at ipinfo.io and append it to the comment. "
-		    "Each IP is looked up once per run. Without a token the free tier "
+		    "Lookups run in a background thread, one at a time, and each IP is "
+		    "looked up once per run. A normal end of run waits for the queue to "
+		    "drain before the final save. Without a token the free tier "
 		    "applies and lookups may be refused after a few hundred.</td></tr>"
 		    "<tr><td><b>IPinfo token</b></td><td>Optional. Used only for this run "
 		    "and never written to settings.</td></tr>"

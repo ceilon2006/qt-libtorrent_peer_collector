@@ -28,31 +28,41 @@ Optional per-IP enrichment via the IPinfo REST API (`ipinfo.io/<ip>/json`).
 ## Layout
 
 ```
-libtorrent_peer_collector_qt.cpp   # everything: helpers, worker thread, main window, main()
+libtorrent_peer_collector_qt.cpp   # everything: helpers, threads, main window, main()
 libtorrent_peer_collector_qt.pro   # qmake project
-.gitignore                         # build output, dotfiles (except .qtcreator, .gitignore)
+scripts/linux/     build.sh rebuild.sh clean.sh deploy.sh
+scripts/windows/   build.bat rebuild.bat clean.bat deploy.bat mingw_env.bat
+docs/build-requirements.html       # which packages are needed and how to install them
+.gitignore                         # build/, build-*/, deploy/, qmake output, dotfiles
 ```
 
 There is intentionally one translation unit. Both `Q_OBJECT` classes live in
 the `.cpp`, so the file ends with `#include "libtorrent_peer_collector_qt.moc"`.
 Keep that line last if you add code.
 
-The header comment mentions a `CMakeLists_libtorrent_peer_collector_qt.txt`.
-That file does not exist. qmake is the only working build.
+qmake is the only build system. There is no CMake file.
 
 ## Build
 
 Toolchain on the dev machine: Qt 6.10, libtorrent-rasterbar 2.0.12 (via
-pkg-config), C++17, Linux.
+pkg-config), C++17, Ubuntu 26.04. Package names for other distros and the
+Windows/MSYS2 route are in `docs/build-requirements.html`.
 
 ```
-qmake6 libtorrent_peer_collector_qt.pro
-make
-./libtorrent_peer_collector_qt
+scripts/linux/build.sh [release|debug]   # out-of-tree into build/ or build-debug/
+scripts/linux/rebuild.sh                 # clean.sh then build.sh
+scripts/linux/clean.sh                   # removes build/, build-*/, deploy/, qmake output
+scripts/linux/deploy.sh [-y] [DEST]      # copy the binary to deploy/ (or DEST)
+scripts/linux/deploy.sh --install [PFX]  # install to PFX/bin + .desktop, default ~/.local
 ```
 
-Build artifacts (`Makefile`, `*.o`, `moc_*`, the binary) are gitignored. Do not
-commit them. There are no tests, no CI, and no README.
+The Windows scripts mirror these and add `windeployqt` plus copying the
+libtorrent and OpenSSL DLLs. They were written against the pattern in
+`qt-p2p_filter_generator` and have not been run on Windows from this repo.
+
+The scripts re-run qmake on every build, so a changed `.pro` is picked up.
+Build output (`build/`, `build-*/`, `deploy/`, `Makefile`, `*.o`, `moc_*`,
+the binary) is gitignored. There are no tests, no CI, and no README.
 
 ## Code map (by section in the .cpp)
 
@@ -65,9 +75,12 @@ commit them. There are no tests, no CI, and no README.
    blocking `QNetworkAccessManager` GET inside a local `QEventLoop` (15 s
    timeout), and parses only the compact `5:peers` byte string with a minimal
    bencode reader. UDP trackers are skipped. Not a general bencode parser.
-3. **IPinfo lookup.** Same blocking GET pattern, 4 s timeout, results cached
-   per IP in memory for the run. Handles both legacy (`country`, `org`) and
-   Lite (`country_code`, `asn{}` object) response shapes.
+3. **IPinfo lookup.** `fetchIpInfoText` is the same blocking GET pattern,
+   4 s timeout. Handles both legacy (`country`, `org`) and Lite
+   (`country_code`, `asn{}` object) response shapes. `IpInfoLookupThread`
+   runs those lookups off the poll loop: a queue of IPs, a result cache, and
+   log lines, all behind one mutex. The worker enqueues every poll, takes a
+   cache snapshot when writing output, and drains the log lines itself.
 4. **Alert classification.** `classifyPeerAlert` maps alert types to an
    endpoint and a source tag with `alert_cast`. `shouldLogAlert` decides what
    reaches the Log tab (error/tracker/dht/status plus error/ban/block peer
@@ -87,6 +100,10 @@ commit them. There are no tests, no CI, and no README.
 
 ## Runtime behaviour worth knowing
 
+- The session is built with `session_flags_t{}` (no default plugins) and
+  `ut_metadata`, `smart_ban` and, only when PEX is checked, `ut_pex` are
+  attached through `add_torrent_params::extensions`. That is how the PEX
+  checkbox works; there is no settings_pack key for it in 2.0.
 - Torrent data is saved to a `QTemporaryDir` with sparse storage. With
   "no download" checked, all files and pieces are set to `dont_download`, but
   the session still connects to peers (that is the point).
@@ -97,9 +114,11 @@ commit them. There are no tests, no CI, and no README.
 - Every direct tracker announce sends `event=started` with a freshly random
   `-QTPC01-` peer id and `left=<total size>`, so trackers see a new leecher on
   each reannounce. Be mindful of this if you lower intervals.
-- The worker's poll cycle can block for a long time: up to 15 s per HTTP
-  tracker plus up to 10 IPinfo lookups × 4 s per cycle. "Stop" only takes
-  effect between cycles, and `closeEvent` waits at most 3 s.
+- The worker's poll cycle can still block on the direct HTTP tracker
+  announce, up to 15 s per tracker. IPinfo no longer blocks it. "Stop" takes
+  effect between cycles; a normal end of run waits for the IPinfo queue to
+  drain, a user Stop abandons it and writes `ipinfo=pending`. `closeEvent`
+  waits at most 3 s.
 - IPv6 peers are dropped everywhere by design (`ipPortToText` returns empty for
   non-v4).
 
@@ -113,13 +132,6 @@ Check these before assuming the code does what its log messages claim.
   `connect` category, not `peer`. tracker/dht alerts carry URLs and counts,
   not addresses, so they only feed the log. Do not add `peer_log` unless you
   also tighten `shouldLogAlert`.
-- **PEX checkbox is cosmetic.** `enablePex` is only logged. In libtorrent 2.0
-  PEX is the `ut_pex` plugin; disabling it means constructing the session
-  without default plugins (`session_params` flags) and adding only the ones
-  you want, not a `settings_pack` key.
-- Listen port spin box allows 0, which yields `listen_interfaces = 0.0.0.0:0`.
-- `directAnnounceAllHttpTrackers` is called twice on startup (once before the
-  loop, once in the first poll iteration).
 - Only peer-category alerts that `classifyPeerAlert` does not handle are
   regex-scraped, so a tracker URL with a raw IP is never mistaken for a peer.
 
@@ -141,7 +153,10 @@ Check these before assuming the code does what its log messages claim.
 ## When changing things
 
 - Any new `Q_OBJECT` class must stay in this `.cpp` (or you must add a header
-  and update the `.pro`) so moc picks it up.
+  and update the `.pro`) so moc picks it up. `IpInfoLookupThread` has no
+  signals and no `Q_OBJECT` on purpose.
+- If you change an option, a tag or the output format, update the Help dialog
+  text and `docs/build-requirements.html` if packages are involved.
 - If you add a libtorrent setting, verify it exists in 2.0.x
   (`/usr/include/libtorrent/settings_pack.hpp`). Several 1.x names are gone.
 - If you touch the output format, keep `savePeersToFile` and the preview tab

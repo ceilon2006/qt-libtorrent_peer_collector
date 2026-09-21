@@ -5,6 +5,13 @@ libtorrent_peer_collector_qt
 *.exe
 .qmake.stash
 
+# out-of-tree build folders from scripts/*/build.*
+build/
+build-*/
+
+# what scripts/*/deploy.* writes
+deploy/
+
 *_Debug*
 *_Release*
 
