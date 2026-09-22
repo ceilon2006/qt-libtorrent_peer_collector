@@ -50,6 +50,7 @@ libtorrent_peer_collector_qt.pro   # qmake project
 scripts/linux/     build.sh rebuild.sh clean.sh deploy.sh
 scripts/windows/   build.bat rebuild.bat clean.bat deploy.bat mingw_env.bat
 docs/build-requirements.html       # which packages are needed and how to install them
+docs/kde-dialog-warning.html       # the kf.kio.widgets.kdirmodel terminal noise: cause and the mute in main()
 .gitignore                         # build/, build-*/, deploy/, qmake output, dotfiles
 ```
 

@@ -73,6 +73,7 @@
 #include <QtCore/QUrlQuery>
 #include <QtCore/QJsonValue>
 #include <QtCore/QLocale>
+#include <QtCore/QLoggingCategory>
 #include <QtCore/QMutex>
 #include <QtCore/QMutexLocker>
 #include <QtCore/QWaitCondition>
@@ -4474,6 +4475,13 @@ int main(int argc, char **argv)
 
 	/* Worker -> GUI signal payload, delivered through the queued connection. */
 	qRegisterMetaType<PeerRows>("PeerRows");
+
+	/*
+	 * KDE's native file dialog logs "No node found for item that was just
+	 * removed" for files that vanished from the folder it lists. Harmless
+	 * KIO chatter, nothing this program did; keep the terminal clean.
+	 */
+	QLoggingCategory::setFilterRules("kf.kio.widgets.kdirmodel.warning=false");
 
 	MainWindow win;
 

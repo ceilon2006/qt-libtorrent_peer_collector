@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KDE Dialog Warning</title>
+<meta name="description" content="Why the collector's terminal shows kf.kio.widgets.kdirmodel warnings about files it never touched, and what was done about it.">
+<style>
+:root {
+  --ground: #f2f4f6;
+  --surface: #ffffff;
+  --surface-2: #e9edf1;
+  --ink: #16191d;
+  --ink-2: #545c66;
+  --ink-3: #7b848f;
+  --rule: #d5dae0;
+  --rule-soft: #e3e8ed;
+  --amber: #a8700f;
+  --amber-bg: #fbf0d8;
+  --amber-edge: #e6a01e;
+  --green: #2f7d4f;
+  --green-bg: #e0f0e6;
+  --green-edge: #2f7d4f;
+  --blue: #2a5c8f;
+  --blue-bg: #e2ebf5;
+  --blue-edge: #4a7fb5;
+  --red: #b02a26;
+  --red-bg: #fbe4e2;
+  --red-edge: #c8322d;
+
+  --measure: 110ch;
+  --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "Cascadia Mono", Consolas, "DejaVu Sans Mono", monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ground: #14171a;
+    --surface: #1c2024;
+    --surface-2: #23282d;
+    --ink: #e7eaee;
+    --ink-2: #a4adb8;
+    --ink-3: #7d8791;
+    --rule: #333a41;
+    --rule-soft: #272d33;
+    --amber: #e6b053;
+    --amber-bg: #33280f;
+    --green: #6cc08b;
+    --green-bg: #16301f;
+    --green-edge: #3d9a63;
+    --blue: #85b3e0;
+    --blue-bg: #182634;
+    --blue-edge: #4a7fb5;
+    --red: #f08079;
+    --red-bg: #3a1d1b;
+  }
+}
+:root[data-theme="dark"] {
+  --ground: #14171a;
+  --surface: #1c2024;
+  --surface-2: #23282d;
+  --ink: #e7eaee;
+  --ink-2: #a4adb8;
+  --ink-3: #7d8791;
+  --rule: #333a41;
+  --rule-soft: #272d33;
+  --amber: #e6b053;
+  --amber-bg: #33280f;
+  --green: #6cc08b;
+  --green-bg: #16301f;
+  --green-edge: #3d9a63;
+  --blue: #85b3e0;
+  --blue-bg: #182634;
+  --blue-edge: #4a7fb5;
+  --red: #f08079;
+  --red-bg: #3a1d1b;
+}
+
+* { box-sizing: border-box; }
+html { background: var(--ground); }
+body {
+  margin: 0;
+  padding: 2rem 16px 4rem;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 1rem;
+  line-height: 1.55;
+}
+main {
+  max-width: var(--measure);
+  margin: 0 auto;
+  transition: max-width .15s ease;
+}
+:root[data-width="narrow"] main { max-width: 72ch; }
+:root[data-width="wide"]   main { max-width: 110ch; }
+:root[data-width="full"]   main { max-width: none; }
+
+.width-control {
+  position: fixed;
+  top: 12px;
+  right: 16px;
+  display: flex;
+  gap: 2px;
+  padding: 3px;
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  font-size: .8rem;
+  z-index: 10;
+}
+.width-control button {
+  font: inherit;
+  color: var(--ink-2);
+  background: none;
+  border: 0;
+  border-radius: 4px;
+  padding: .2rem .55rem;
+  cursor: pointer;
+}
+.width-control button:hover { color: var(--ink); background: var(--surface-2); }
+.width-control button[aria-pressed="true"] {
+  color: var(--ink);
+  background: var(--surface-2);
+  font-weight: 600;
+}
+@media (max-width: 720px) {
+  .width-control { display: none; }
+}
+h1 {
+  font-size: 2rem;
+  line-height: 1.15;
+  margin: 0 0 .25rem;
+  letter-spacing: -.01em;
+}
+.subtitle {
+  color: var(--ink-2);
+  margin: 0 0 2rem;
+}
+h2 {
+  font-size: 1.35rem;
+  margin: 2.5rem 0 .75rem;
+  padding-bottom: .3rem;
+  border-bottom: 1px solid var(--rule);
+}
+h3 {
+  font-size: 1.05rem;
+  margin: 1.5rem 0 .5rem;
+}
+p { margin: 0 0 .9rem; }
+ul, ol { margin: 0 0 .9rem; padding-left: 1.4rem; }
+li { margin: .2rem 0; }
+code, pre {
+  font-family: var(--mono);
+  font-size: .92em;
+}
+code {
+  background: var(--surface-2);
+  padding: .08em .35em;
+  border-radius: 3px;
+}
+pre {
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  padding: .75rem 1rem;
+  overflow-x: auto;
+  margin: 0 0 1rem;
+  line-height: 1.45;
+}
+pre code { background: none; padding: 0; }
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0 0 1.25rem;
+  font-size: .95rem;
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  overflow: hidden;
+}
+th, td {
+  text-align: left;
+  vertical-align: top;
+  padding: .5rem .7rem;
+  border-bottom: 1px solid var(--rule-soft);
+}
+th {
+  background: var(--surface-2);
+  color: var(--ink-2);
+  font-weight: 600;
+  font-size: .85rem;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+tr:last-child td { border-bottom: none; }
+.table-wrap { overflow-x: auto; margin: 0 0 1.25rem; }
+.table-wrap table { margin: 0; min-width: 40rem; }
+
+.note {
+  border-left: 4px solid var(--blue-edge);
+  background: var(--blue-bg);
+  padding: .6rem .9rem;
+  border-radius: 0 6px 6px 0;
+  margin: 0 0 1rem;
+}
+.warn {
+  border-left: 4px solid var(--amber-edge);
+  background: var(--amber-bg);
+  padding: .6rem .9rem;
+  border-radius: 0 6px 6px 0;
+  margin: 0 0 1rem;
+}
+.ok {
+  border-left: 4px solid var(--green-edge);
+  background: var(--green-bg);
+  padding: .6rem .9rem;
+  border-radius: 0 6px 6px 0;
+  margin: 0 0 1rem;
+}
+.note p:last-child, .warn p:last-child, .ok p:last-child { margin-bottom: 0; }
+.err { color: var(--red); font-family: var(--mono); font-size: .9em; }
+.muted { color: var(--ink-3); }
+footer {
+  margin-top: 3rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--rule);
+  color: var(--ink-3);
+  font-size: .85rem;
+}
+</style>
+</head>
+<body>
+<div class="width-control" role="group" aria-label="Page width">
+  <button type="button" data-width="narrow">Narrow</button>
+  <button type="button" data-width="wide">Wide</button>
+  <button type="button" data-width="full">Full</button>
+</div>
+<main>
+
+<h1>KDE Dialog Warning</h1>
+<p class="subtitle">Why <code>kf.kio.widgets.kdirmodel: No node found for item that was just removed</code> appears in the terminal, who prints it, and what the collector does about it.</p>
+
+<div class="ok">
+<p>Written 2026-09-22 after the messages were seen on Kubuntu 26.04 with Qt 6.10.2 and KDE Frameworks 6. Nothing was wrong with the program and no file was touched. The messages are muted in <code>main()</code> since that date.</p>
+</div>
+
+<h2 id="symptom">What appears</h2>
+
+<p>Started from a terminal on a KDE desktop, the collector sometimes prints lines like these while it runs:</p>
+
+<pre><code>kf.kio.widgets.kdirmodel: No node found for item that was just removed: QUrl("file:///home/award/Downloads/chatgpt_amd64.deb")
+kf.kio.widgets.kdirmodel: No node found for item that was just removed: QUrl("file:///home/award/Downloads/kubuntu_development_packages_install_guide.html")
+kf.kio.widgets.kdirmodel: No node found for item that was just removed: QUrl("file:///home/award/Downloads/torrent_peer_discovery_gui_code_explanation_manual.html")</code></pre>
+
+<p>The files named are real files in the Downloads folder. None of them is a torrent, none was moved or deleted, and the collector's own code never refers to any of them.</p>
+
+<h2 id="who">Who prints it</h2>
+
+<p>The line is written from inside the collector's process, but not by the collector's code. The chain is:</p>
+
+<ol>
+<li>On a KDE desktop Qt loads KDE's <b>platform integration plugin</b> into every Qt application, so that dialogs, fonts and colours match the desktop.</li>
+<li>When the collector calls <code>QFileDialog::getOpenFileName</code> for the torrent file, that plugin substitutes the <b>KDE file dialog</b> for Qt's own.</li>
+<li>The KDE file dialog lives in the <b>KIO</b> library (<code>libKF6KIOWidgets</code>). Its file list is a <code>KDirModel</code>, fed by a <code>KDirLister</code> that lists and watches the folder.</li>
+<li><code>KDirModel</code> logs under the category <code>kf.kio.widgets.kdirmodel</code>. Because it runs in the collector's process, its output lands on the collector's standard error, which is the terminal the program was started from.</li>
+</ol>
+
+<p>You can confirm the KIO libraries are mapped into the running collector:</p>
+
+<pre><code>grep -c KIO /proc/$(pgrep -f build/libtorrent_peer_collector_qt)/maps</code></pre>
+
+<p>Any number above zero means KIO is loaded. Started with <code>QT_QPA_PLATFORMTHEME=generic</code> the count is zero, Qt's own dialog is used, and the messages never appear.</p>
+
+<h2 id="why">Why it is printed</h2>
+
+<p>The torrent dialog is opened with the name filter <b>Torrent files (*.torrent)</b>. <code>KDirLister</code> reads the whole folder but hands the model only the entries that pass the filter, so a <code>.deb</code> or an <code>.html</code> file never gets a node in the model.</p>
+
+<p>Later the listing is refreshed. That happens whenever the folder changes in any way, for example a download finishing or a browser writing a temporary file, and again whenever the dialog is opened a second time. On a refresh KIO re-applies the filter and reports every entry that does not match as <i>removed</i>. For an entry the model never inserted there is nothing to remove, and <code>KDirModel</code> logs exactly the line above.</p>
+
+<div class="note">
+<p>In short: KIO reports the hiding of filtered-out files as removals to a model that never showed them. The files are untouched. The warning comes from KDE Frameworks and shows up in any Qt application that opens a filtered KDE file dialog from a terminal.</p>
+</div>
+
+<p>The same message can also be produced the honest way, when a file really is deleted or moved out of a watched folder that the model has not listed yet, for example between two openings of the dialog. Both cases are harmless.</p>
+
+<h2 id="done">What was done</h2>
+
+<p>One line in <code>main()</code>, right after the application is created, mutes that single logging category:</p>
+
+<pre><code>QLoggingCategory::setFilterRules("kf.kio.widgets.kdirmodel.warning=false");</code></pre>
+
+<p>The rule is as narrow as it can be:</p>
+
+<ul>
+<li>It affects only the category <code>kf.kio.widgets.kdirmodel</code> and only its warning level.</li>
+<li>Every other message from Qt, libtorrent, KIO's other components and the collector itself still prints.</li>
+<li>It changes nothing about the dialog: the KDE look, the torrent filter and the folder memory stay as they were.</li>
+</ul>
+
+<h2 id="alternatives">Alternatives that were not chosen</h2>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>Option</th><th>Effect</th><th>Why not</th></tr>
+</thead>
+<tbody>
+<tr><td>Set <code>QT_LOGGING_RULES="kf.kio.widgets.kdirmodel.warning=false"</code> in the environment</td><td>Same silence, for every KDE application started from that shell</td><td>Has to be set by whoever starts the program; the in-program rule needs nothing</td></tr>
+<tr><td>Start with <code>QT_QPA_PLATFORMTHEME=generic</code></td><td>Qt's own file dialog, KIO never loaded</td><td>Loses the KDE dialog: places sidebar, previews, desktop look</td></tr>
+<tr><td>Open the dialog without a name filter</td><td>Every file listed, so nothing is ever filtered out and reported</td><td>Loses the torrent-only listing, which is the point of the filter</td></tr>
+<tr><td>Force Qt's dialog with <code>QFileDialog::DontUseNativeDialog</code></td><td>Like the generic theme, but only for this dialog</td><td>Same loss of the KDE dialog, and inconsistent with the other dialogs</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="check">How to check the fix</h2>
+
+<ol>
+<li>Build and start from a terminal: <code>scripts/linux/build.sh &amp;&amp; build/libtorrent_peer_collector_qt</code>.</li>
+<li>Open the torrent dialog, pick a file, run a collection, open the dialog again.</li>
+<li>The terminal stays clean. Genuine warnings, should any occur, still print.</li>
+</ol>
+
+<footer>
+<p>Part of <code>libtorrent_peer_collector_qt</code>. Companion to <code>build-requirements.html</code> and <code>AGENTS.md</code>.</p>
+</footer>
+
+</main>
+<script>
+(function () {
+  var root = document.documentElement;
+  var buttons = document.querySelectorAll('.width-control button');
+  var key = 'kde-dialog-warning.width';
+
+  function apply(width) {
+    root.setAttribute('data-width', width);
+    for (var i = 0; i < buttons.length; i++) {
+      buttons[i].setAttribute('aria-pressed', buttons[i].getAttribute('data-width') === width ? 'true' : 'false');
+    }
+  }
+
+  var saved = 'wide';
+  try {
+    saved = localStorage.getItem(key) || 'wide';
+  } catch (e) {
+  }
+  apply(saved);
+
+  for (var i = 0; i < buttons.length; i++) {
+    buttons[i].addEventListener('click', function () {
+      var width = this.getAttribute('data-width');
+      apply(width);
+      try {
+        localStorage.setItem(key, width);
+      } catch (e) {
+      }
+    });
+  }
+})();
+</script>
+</body>
+</html>
