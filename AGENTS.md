@@ -117,15 +117,26 @@ the binary) is gitignored. There are no tests, no CI, and no README.
    runs those lookups off the poll loop: a queue of IPs, a result cache, and
    log lines, all behind one mutex. The worker enqueues every poll, takes a
    cache snapshot when writing output, and drains the log lines itself.
-4. **Alert classification.** `classifyPeerAlert` maps alert types to an
+4. **ASN prefix lookup.** `AsnPrefixThread` (Q_OBJECT, one signal `done`)
+   asks RIPEstat's Data API: network-info (IP -> origin AS), as-overview
+   (holder, only when the table gave no provider), rir-stats-country (only
+   when the table gave no country), announced-prefixes (IPv4 only, sorted).
+   `formatAsnPrefixList` writes the filter format: `# AS, country, city,
+   holder` header, then `CIDR<pad># same, address-count` lines. Started from
+   the table's context menu; hints are the row's Country/City/Provider cells
+   (provider stripped of `ASnnnn `). Dialog is non-modal with Copy/Save,
+   Save uses `paths/peers_dir`. Threads are tracked in `asnThreads` and
+   joined in `~MainWindow`. Verified live 2026-09-22 against AS8580 and
+   AS12389.
+5. **Alert classification.** `classifyPeerAlert` maps alert types to an
    endpoint and a source tag with `alert_cast`. `shouldLogAlert` decides what
    reaches the Log tab (error/tracker/dht/status plus error/ban/block peer
    alerts; connect/disconnect are too frequent to log).
-5. **`PeerCollectorThread : QThread`.** All libtorrent work happens in `run()`.
+6. **`PeerCollectorThread : QThread`.** All libtorrent work happens in `run()`.
    Communicates with the GUI only through signals (`logMessage`,
    `peerCountChanged`, `peersPreviewChanged`, `progressChanged`,
    `finishedStatus`). Stop is cooperative via `std::atomic<bool>`.
-6. **`MainWindow : QMainWindow`.** Form of options, Start/Stop, Log and Peers
+7. **`MainWindow : QMainWindow`.** Form of options, Start/Stop, Log and Peers
    tabs, progress bar. Settings identity is `CONFIG_FOLDER_NAME` /
    `APP_NAME` (`myutils` / `LibtorrentPeerCollectorQt`), the same scheme as
    `qt-p2p_filter_generator`; `main()` registers the same names on the
@@ -135,7 +146,7 @@ the binary) is gitignored. There are no tests, no CI, and no README.
    `showHelpDialog` / `addHelpPage`, same pattern as the sibling
    `qt-p2p_filter_generator` and `qt-web_selector` projects. Keep the help
    text in step with the options and tags it describes.
-7. **`main()`.**
+8. **`main()`.**
 
 ## Runtime behaviour worth knowing
 

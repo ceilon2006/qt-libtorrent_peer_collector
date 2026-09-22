@@ -72,6 +72,7 @@
 #include <QtCore/QIODevice>
 #include <QtCore/QUrlQuery>
 #include <QtCore/QJsonValue>
+#include <QtCore/QLocale>
 #include <QtCore/QMutex>
 #include <QtCore/QMutexLocker>
 #include <QtCore/QWaitCondition>
@@ -1819,6 +1820,274 @@ private:
 };
 
 /* ------------------------------------------------------------------------- */
+/* ASN prefix lookup (RIPEstat)                                               */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * One blocking JSON GET, same pattern as fetchIpInfoText. Runs on a worker
+ * thread, never on the GUI thread.
+ */
+static QJsonObject fetchJsonObject(const QUrl &url, int timeout_ms, QString *error)
+{
+	QNetworkAccessManager manager;
+	QNetworkRequest request(url);
+	request.setHeader(QNetworkRequest::UserAgentHeader, "libtorrent-peer-collector-qt/1.0");
+
+	QNetworkReply *reply = manager.get(request);
+	QEventLoop loop;
+	QTimer timeout;
+	timeout.setSingleShot(true);
+
+	QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+	QObject::connect(&timeout, &QTimer::timeout, &loop, &QEventLoop::quit);
+
+	timeout.start(timeout_ms);
+	loop.exec();
+
+	if (!timeout.isActive()) {
+		reply->abort();
+		reply->deleteLater();
+		if (error != nullptr) {
+			*error = "timeout";
+		}
+		return QJsonObject();
+	}
+
+	timeout.stop();
+
+	QByteArray data = reply->readAll();
+	QNetworkReply::NetworkError net_error = reply->error();
+	QString error_string = reply->errorString();
+	reply->deleteLater();
+
+	if (net_error != QNetworkReply::NoError) {
+		if (error != nullptr) {
+			*error = error_string;
+		}
+		return QJsonObject();
+	}
+
+	QJsonParseError parse_error;
+	QJsonDocument doc = QJsonDocument::fromJson(data, &parse_error);
+
+	if (parse_error.error != QJsonParseError::NoError || !doc.isObject()) {
+		if (error != nullptr) {
+			*error = "bad JSON";
+		}
+		return QJsonObject();
+	}
+
+	return doc.object();
+}
+
+static bool ipv4PrefixSortKey(const QString &prefix, quint32 *ip_out, int *len_out)
+{
+	int slash = prefix.indexOf('/');
+	quint32 ip;
+	quint16 dummy_port;
+	bool ok;
+	int len;
+
+	if (slash <= 0) {
+		return false;
+	}
+
+	if (!ipv4PortToSortKey(prefix.left(slash) + ":0", &ip, &dummy_port)) {
+		return false;
+	}
+
+	len = prefix.mid(slash + 1).toInt(&ok);
+	if (!ok || len < 0 || len > 32) {
+		return false;
+	}
+
+	*ip_out = ip;
+	*len_out = len;
+
+	return true;
+}
+
+/*
+ * The prefix pool as text, in the format used for filters:
+ *
+ *   # AS8580, RU, Nizhniy Novgorod, MTS PJSC
+ *   5.227.45.0/24        # AS8580, RU, Nizhniy Novgorod, MTS PJSC, 256
+ *   5.227.64.0/19        # AS8580, RU, Nizhniy Novgorod, MTS PJSC, 8,192
+ *
+ * Header: AS, country, city, holder, empty ones left out. Each line: the
+ * CIDR, an aligned # comment repeating the header, and the number of
+ * addresses in the prefix with thousands separators.
+ */
+static QString formatAsnPrefixList(const QString &asn,
+                                   const QString &country,
+                                   const QString &city,
+                                   const QString &holder,
+                                   const QStringList &prefixes)
+{
+	QStringList label_parts;
+	QString label;
+	QStringList lines;
+	QLocale en(QLocale::English, QLocale::UnitedStates);
+	int column;
+
+	label_parts << "AS" + asn;
+	for (const QString &part : {country, city, holder}) {
+		if (!part.trimmed().isEmpty()) {
+			label_parts << part.trimmed();
+		}
+	}
+	label = label_parts.join(", ");
+
+	lines << "# " + label;
+
+	column = calculatePeerCommentColumn(prefixes);
+
+	for (const QString &prefix : prefixes) {
+		quint32 ip = 0;
+		int len = 0;
+		QString count;
+
+		if (ipv4PrefixSortKey(prefix, &ip, &len)) {
+			count = en.toString((qlonglong)1 << (32 - len));
+		}
+
+		lines << formatPeerLineWithComment(prefix, label + (count.isEmpty() ? QString() : ", " + count), column);
+	}
+
+	return lines.join("\n") + "\n";
+}
+
+/*
+ * Resolve an IP to its origin AS and fetch every IPv4 prefix that AS
+ * announces, using RIPEstat's public Data API (no key, no login):
+ *
+ *   network-info        IP -> asns[]
+ *   as-overview         AS -> holder (organisation name)
+ *   rir-stats-country   AS -> country, only when the caller has none
+ *   announced-prefixes  AS -> prefixes[] as seen in BGP (RIS)
+ *
+ * Country and city normally come from the peer's IPinfo record (the table
+ * cells), passed in by the caller. Short requests on a thread of their own;
+ * the result is one signal.
+ */
+class AsnPrefixThread : public QThread {
+	Q_OBJECT
+
+public:
+	/*
+	 * country, city and holder are hints from the peer's IPinfo cells and
+	 * may be empty. A given holder wins over RIPEstat's, so the label reads
+	 * "MTS PJSC" as IPinfo names it rather than RIPEstat's "SANDY MTS PJSC".
+	 */
+	AsnPrefixThread(const QString &ip,
+	                const QString &country,
+	                const QString &city,
+	                const QString &holder_hint,
+	                QObject *parent = nullptr)
+	    : QThread(parent),
+	      ip(ip),
+	      country(country),
+	      city(city),
+	      holderHint(holder_hint)
+	{
+	}
+
+signals:
+	void done(const QString &ip,
+	          const QString &asn,
+	          const QString &holder,
+	          const QString &country,
+	          const QString &city,
+	          const QStringList &prefixes,
+	          const QString &error);
+
+protected:
+	void run() override
+	{
+		const QString base = "https://stat.ripe.net/data/";
+		const QString app = "&sourceapp=libtorrent-peer-collector-qt";
+		QString error;
+		QString asn;
+		QString holder;
+		QString found_country = country;
+		QStringList prefixes;
+		QJsonObject obj;
+
+		obj = fetchJsonObject(QUrl(base + "network-info/data.json?resource=" + ip + app), 15000, &error);
+		if (obj.isEmpty()) {
+			emit done(ip, QString(), QString(), country, city, QStringList(), "network-info: " + error);
+			return;
+		}
+
+		{
+			QJsonArray asns = obj.value("data").toObject().value("asns").toArray();
+
+			if (asns.isEmpty()) {
+				emit done(ip, QString(), QString(), country, city, QStringList(), "RIPEstat knows no origin AS for " + ip);
+				return;
+			}
+
+			asn = asns.first().toVariant().toString();
+		}
+
+		holder = holderHint.trimmed();
+
+		if (holder.isEmpty()) {
+			obj = fetchJsonObject(QUrl(base + "as-overview/data.json?resource=AS" + asn + app), 15000, &error);
+			if (!obj.isEmpty()) {
+				holder = obj.value("data").toObject().value("holder").toString();
+			}
+		}
+
+		if (found_country.trimmed().isEmpty()) {
+			obj = fetchJsonObject(QUrl(base + "rir-stats-country/data.json?resource=AS" + asn + app), 15000, &error);
+			if (!obj.isEmpty()) {
+				QJsonArray located = obj.value("data").toObject().value("located_resources").toArray();
+
+				if (!located.isEmpty()) {
+					found_country = located.first().toObject().value("location").toString();
+				}
+			}
+		}
+
+		obj = fetchJsonObject(QUrl(base + "announced-prefixes/data.json?resource=AS" + asn + app), 30000, &error);
+		if (obj.isEmpty()) {
+			emit done(ip, asn, holder, found_country, city, QStringList(), "announced-prefixes: " + error);
+			return;
+		}
+
+		for (const QJsonValue &v : obj.value("data").toObject().value("prefixes").toArray()) {
+			QString prefix = v.toObject().value("prefix").toString();
+
+			if (!prefix.isEmpty() && !prefix.contains(':')) {
+				prefixes << prefix;
+			}
+		}
+
+		prefixes.removeDuplicates();
+
+		std::sort(prefixes.begin(), prefixes.end(), [](const QString &a, const QString &b) {
+			quint32 aip = 0, bip = 0;
+			int alen = 0, blen = 0;
+
+			if (!ipv4PrefixSortKey(a, &aip, &alen) || !ipv4PrefixSortKey(b, &bip, &blen)) {
+				return a < b;
+			}
+
+			return aip != bip ? aip < bip : alen < blen;
+		});
+
+		emit done(ip, asn, holder, found_country, city, prefixes, QString());
+	}
+
+private:
+	QString ip;
+	QString country;
+	QString city;
+	QString holderHint;
+};
+
+/* ------------------------------------------------------------------------- */
 /* Alert classification                                                       */
 /* ------------------------------------------------------------------------- */
 
@@ -2727,6 +2996,12 @@ public:
 			worker->requestStop();
 			worker->wait(15000);
 		}
+
+		for (const QPointer<AsnPrefixThread> &t : asnThreads) {
+			if (!t.isNull()) {
+				t->wait();
+			}
+		}
 	}
 
 protected:
@@ -2833,6 +3108,9 @@ private:
 	 * is open. Only one is ever built: a second Help click raises this one.
 	 */
 	QPointer<QDialog> helpDialog;
+
+	/* ASN lookups in flight; joined before the window goes away. */
+	QList<QPointer<AsnPrefixThread>> asnThreads;
 
 	/* Set in closeEvent: no dialogs from that point on. */
 	bool closing = false;
@@ -3291,6 +3569,17 @@ private:
 		    "selected rows, in the same text format as Copy Peers.</td></tr>"
 		    "<tr><td><b>Copy all peers</b></td><td>Same as the Copy Peers "
 		    "button.</td></tr>"
+		    "<tr><td><b>Get ASN IPv4 prefixes for ...</b></td><td>Finds the "
+		    "autonomous system that announces the selected peer's IP and lists "
+		    "every IPv4 prefix that AS announces in BGP right now: the address "
+		    "pool of the peer's network operator, ready for a filter. The list "
+		    "opens in its own window with Copy and Save. Format: a header "
+		    "comment with AS number, country, city and holder, then one CIDR "
+		    "per line with the same comment plus the number of addresses. "
+		    "Country, city and the operator name come from the peer's IPinfo "
+		    "cells when present (the provider without its AS number), otherwise "
+		    "from RIPEstat; the prefixes always come from RIPEstat's public API "
+		    "(stat.ripe.net), no key needed.</td></tr>"
 		    "</table>"
 		    "<h3>Text format of Copy and Save</h3>"
 		    "<p>One peer per line in the table's current order. With "
@@ -3977,6 +4266,12 @@ private slots:
 	/* The IP of the current row, or of the first selected row, or empty. */
 	QString selectedPeerIp() const
 	{
+		return selectedPeerCell(COL_IP);
+	}
+
+	/* A cell of the current row, or of the first selected row, or empty. */
+	QString selectedPeerCell(int column) const
+	{
 		QModelIndex idx = peersTable->currentIndex();
 		QModelIndexList rows = peersTable->selectionModel()->selectedRows(COL_IP);
 
@@ -3988,20 +4283,26 @@ private slots:
 			return QString();
 		}
 
-		return peersProxy->index(idx.row(), COL_IP).data().toString();
+		return peersProxy->index(idx.row(), column).data().toString();
 	}
 
 	void showPeersContextMenu(const QPoint &pos)
 	{
 		QMenu menu(this);
 		int selected = peersTable->selectionModel()->selectedRows().size();
+		QString ip = selectedPeerIp();
 		QAction *copy_sel;
 		QAction *copy_all;
+		QAction *asn;
 
 		copy_sel = menu.addAction(QString("Copy %1 selected peer(s)\tCtrl+C").arg(selected));
 		copy_sel->setEnabled(selected > 0);
 		copy_all = menu.addAction("Copy all peers");
 		copy_all->setEnabled(peersProxy->rowCount() > 0);
+		menu.addSeparator();
+		asn = menu.addAction(ip.isEmpty() ? QString("Get ASN IPv4 prefixes...")
+		                                  : QString("Get ASN IPv4 prefixes for %1...").arg(ip));
+		asn->setEnabled(!ip.isEmpty());
 
 		QAction *chosen = menu.exec(peersTable->viewport()->mapToGlobal(pos));
 
@@ -4009,7 +4310,151 @@ private slots:
 			copySelectedPeers();
 		} else if (chosen == copy_all) {
 			copyPeers();
+		} else if (chosen == asn) {
+			/*
+			 * Country, city and provider as the table shows them. "(pending)"
+			 * is not a country, and the provider's leading "AS1234 " is
+			 * dropped so the label reads like the user's filter files.
+			 */
+			static const QRegularExpression as_prefix("^AS\\d+\\s+");
+			QString country = selectedPeerCell(COL_COUNTRY);
+			QString city = selectedPeerCell(COL_CITY);
+			QString holder = selectedPeerCell(COL_PROVIDER);
+
+			if (country.startsWith('(')) {
+				country.clear();
+			}
+
+			holder.remove(as_prefix);
+
+			lookupAsnPrefixes(ip, country, city, holder);
 		}
+	}
+
+	void lookupAsnPrefixes(const QString &ip, const QString &country, const QString &city, const QString &holder)
+	{
+		AsnPrefixThread *t;
+
+		if (ip.isEmpty()) {
+			return;
+		}
+
+		t = new AsnPrefixThread(ip, country, city, holder, this);
+		asnThreads << t;
+
+		connect(t, &AsnPrefixThread::done, this, &MainWindow::asnPrefixesReady);
+		connect(t, &QThread::finished, t, &QObject::deleteLater);
+
+		statusLabel->setText("Looking up origin AS and announced IPv4 prefixes for " + ip + " at RIPEstat...");
+		t->start();
+	}
+
+	void asnPrefixesReady(const QString &ip,
+	                      const QString &asn,
+	                      const QString &holder,
+	                      const QString &country,
+	                      const QString &city,
+	                      const QStringList &prefixes,
+	                      const QString &error)
+	{
+		if (closing || !isVisible()) {
+			return;
+		}
+
+		if (!error.isEmpty()) {
+			statusLabel->setText("ASN lookup failed for " + ip + ": " + error);
+			QMessageBox::warning(this, "ASN lookup failed", ip + "\n\n" + error);
+			return;
+		}
+
+		statusLabel->setText(QString("AS%1 announces %2 IPv4 prefix(es).").arg(asn).arg(prefixes.size()));
+		showAsnPrefixDialog(ip, asn, holder, country, city, prefixes);
+	}
+
+	/*
+	 * The prefix pool in the filter format, with Copy and Save. Not modal:
+	 * several can be open, one per AS looked up.
+	 */
+	void showAsnPrefixDialog(const QString &ip,
+	                         const QString &asn,
+	                         const QString &holder,
+	                         const QString &country,
+	                         const QString &city,
+	                         const QStringList &prefixes)
+	{
+		QDialog *dialog = new QDialog(this);
+		QVBoxLayout *layout = new QVBoxLayout(dialog);
+		QLabel *heading = new QLabel(dialog);
+		QPlainTextEdit *text = new QPlainTextEdit(dialog);
+		QHBoxLayout *buttons = new QHBoxLayout();
+		QPushButton *copy = new QPushButton("Copy", dialog);
+		QPushButton *save = new QPushButton("Save...", dialog);
+		QPushButton *close = new QPushButton("Close", dialog);
+		QString body = formatAsnPrefixList(asn, country, city, holder, prefixes);
+		QFont mono("monospace");
+
+		mono.setStyleHint(QFont::Monospace);
+		mono.setFixedPitch(true);
+
+		dialog->setWindowTitle(QString("AS%1 IPv4 prefixes").arg(asn));
+		dialog->setAttribute(Qt::WA_DeleteOnClose);
+		dialog->resize(720, 560);
+
+		heading->setTextFormat(Qt::RichText);
+		heading->setWordWrap(true);
+		heading->setText(QString("<b>%1</b> is announced by <b>AS%2</b>%3.<br>"
+		                         "%4 IPv4 prefix(es) in BGP right now, from RIPEstat, %5.")
+		                     .arg(ip.toHtmlEscaped())
+		                     .arg(asn.toHtmlEscaped())
+		                     .arg(holder.isEmpty() ? QString() : " (" + holder.toHtmlEscaped() + ")")
+		                     .arg(prefixes.size())
+		                     .arg(QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm")));
+
+		text->setFont(mono);
+		text->setReadOnly(true);
+		text->setLineWrapMode(QPlainTextEdit::NoWrap);
+		text->setPlainText(body);
+
+		buttons->addWidget(copy);
+		buttons->addWidget(save);
+		buttons->addStretch(1);
+		buttons->addWidget(close);
+
+		layout->addWidget(heading);
+		layout->addWidget(text, 1);
+		layout->addLayout(buttons);
+
+		connect(close, &QPushButton::clicked, dialog, &QDialog::close);
+		connect(copy, &QPushButton::clicked, this, [this, body, asn]() {
+			QApplication::clipboard()->setText(body);
+			statusLabel->setText(QString("AS%1 prefixes copied to clipboard.").arg(asn));
+		});
+		connect(save, &QPushButton::clicked, this, [this, dialog, body, asn]() {
+			QString path = QFileDialog::getSaveFileName(
+			    dialog,
+			    "Save prefixes",
+			    peersDialogDir() + QString("/AS%1-ipv4-prefixes.txt").arg(asn),
+			    "Text files (*.txt);;All files (*)");
+
+			if (path.isEmpty()) {
+				return;
+			}
+
+			QFile f(path);
+			if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) {
+				QMessageBox::warning(dialog, "Save failed", f.errorString());
+				return;
+			}
+
+			f.write(body.toUtf8());
+			f.close();
+
+			lastPeersDir = QFileInfo(path).absolutePath();
+			saveSettings();
+			statusLabel->setText("Saved prefixes to " + path);
+		});
+
+		dialog->show();
 	}
 
 };
