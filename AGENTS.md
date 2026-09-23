@@ -191,6 +191,12 @@ the binary) is gitignored. There are no tests, no CI, and no README.
   2 s timeouts), the IPinfo queue is abandoned (`ipinfo=pending`), then the
   final save. A normal end of run waits for the IPinfo queue to drain.
   `closeEvent` waits at most 3 s for the thread.
+- While a run is active the Torrent and Options group boxes are disabled
+  (`setInputsEnabled`); every field in them is read once at Start. Buttons
+  and the Copy/Save checkboxes stay enabled. `collectionFinished` must not
+  clear `worker`: `finishedStatus` arrives before `run()` returns and the
+  session teardown after it takes 1-2 s; the `QPointer` nulls itself when
+  the thread self-deletes, and the destructor waits on it until then.
 - IPv6 peers are dropped everywhere by design (`ipPortToText` returns empty for
   non-v4).
 - The machine's own addresses are pruned from the peer set every poll and

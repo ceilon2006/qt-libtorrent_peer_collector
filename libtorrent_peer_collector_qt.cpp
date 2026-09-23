@@ -3083,6 +3083,14 @@ protected:
 private:
 	QSettings settings;
 
+	/*
+	 * Everything in these two groups is read once at Start and handed to
+	 * the worker, so they are disabled for the length of a run. The buttons
+	 * and the Copy/Save checkboxes stay live: they act on the current output.
+	 */
+	QGroupBox *torrentGroup = nullptr;
+	QGroupBox *optionsGroup = nullptr;
+
 	QLineEdit *torrentPathEdit = nullptr;
 	QString lastPeersDir;    /* folder of the last Save Peers */
 	QSpinBox *runTimeSpin = nullptr;
@@ -3153,6 +3161,7 @@ private:
 		QPushButton *browse_torrent;
 
 		group = new QGroupBox("Torrent", this);
+		torrentGroup = group;
 		grid = new QGridLayout(group);
 
 		torrentPathEdit = new QLineEdit(group);
@@ -3173,6 +3182,7 @@ private:
 		QFormLayout *form;
 
 		group = new QGroupBox("Options", this);
+		optionsGroup = group;
 		form = new QFormLayout(group);
 
 		runTimeSpin = new QSpinBox(group);
@@ -3407,6 +3417,9 @@ private:
 		    "point; it refreshes every 3 seconds while running.</li>"
 		    "</ol>"
 		    "<h3>While it runs</h3>"
+		    "<p>While a run is active the torrent and every option are greyed out: "
+		    "they are read once at Start, so a change would only take effect on "
+		    "the next run. Copy, Save and the Copy/Save boxes stay available.</p>"
 		    "<p><b>Stop</b> interrupts whatever the collector is doing within a "
 		    "fraction of a second: the poll sleep, a tracker announce in flight, "
 		    "and the IPinfo queue. It then tells the trackers that answered "
@@ -3472,11 +3485,19 @@ private:
 		    "and hostname for each IP from ipinfo.io and show them in the table. "
 		    "Lookups run in a background thread, one at a time, and each IP is "
 		    "looked up once per run. A normal end of run waits for the queue to "
-		    "drain. Without a token the free tier applies and lookups may be "
-		    "refused after a few hundred. When off, the IPinfo columns are "
-		    "hidden.</td></tr>"
-		    "<tr><td><b>IPinfo token</b></td><td>Optional. Used only for this run "
-		    "and never written to settings.</td></tr>"
+		    "drain. When off, the IPinfo columns are hidden.</td></tr>"
+		    "<tr><td><b>IPinfo token</b></td><td>An API key for the ipinfo.io "
+		    "service. Without one the requests are anonymous and ipinfo allows "
+		    "only a small daily number per address, in the region of a thousand; "
+		    "after that every answer is a refusal, shown as <tt>(unavailable)</tt> "
+		    "in the table. With a token the lookups count against your ipinfo "
+		    "account instead, which has a far larger quota; a free account gives "
+		    "country and provider, paid plans add city and hostname. Get one by "
+		    "signing up at ipinfo.io; it is a short string on the account page. "
+		    "Paste it here before Start. It is sent only with this run's requests "
+		    "and is never written to settings, so the field is empty at every "
+		    "start. Leave it blank unless you see <tt>(unavailable)</tt> "
+		    "results.</td></tr>"
 		    "</table>"
 		    "<h3>Copy/Save includes</h3>"
 		    "<p>The two boxes next to the buttons decide what follows the "
@@ -3961,6 +3982,7 @@ private slots:
 		connect(worker, &QThread::finished, worker, &QObject::deleteLater);
 
 		startButton->setEnabled(false);
+		setInputsEnabled(false);
 		stopButton->setText("Stop");
 		stopButton->setEnabled(true);
 
@@ -4215,13 +4237,33 @@ private slots:
 		}
 	}
 
+	void setInputsEnabled(bool enabled)
+	{
+		torrentGroup->setEnabled(enabled);
+		optionsGroup->setEnabled(enabled);
+
+		if (enabled) {
+			/* The PEX rule depends on the other discovery boxes; re-apply it. */
+			updatePexAvailability();
+		}
+	}
+
 	void collectionFinished(bool ok, const QString &message)
 	{
 		startButton->setEnabled(true);
+		setInputsEnabled(true);
 		stopButton->setEnabled(false);
 		stopButton->setText("Stop");
 		statusLabel->setText(message);
-		worker = nullptr;
+
+		/*
+		 * The worker is not cleared here: finishedStatus is emitted before
+		 * run() returns, and the libtorrent session teardown after it takes
+		 * a second or two. The QPointer goes null on its own when the thread
+		 * deletes itself, and until then closeEvent and the destructor can
+		 * still wait for it. Clearing it early let a close in that gap
+		 * destroy a running QThread, which aborts the process.
+		 */
 
 		if (ok) {
 			progress->setValue(100);
